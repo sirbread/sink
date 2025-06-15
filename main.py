@@ -5,6 +5,7 @@ import socket
 import threading
 import requests
 import uuid
+import fnmatch
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -14,6 +15,7 @@ from fastapi import FastAPI, UploadFile, File
 import uvicorn
 
 FOLDER_TO_SYNC = Path(__file__).parent.resolve() / "sync"
+SINKIGNORE_FILE = FOLDER_TO_SYNC / ".sinkignore"
 PEER_PORT = 9001
 SERVICE_TYPE = "_sink._tcp.local."
 
@@ -21,6 +23,20 @@ unique_id = str(uuid.uuid4())[:8]
 SERVICE_NAME = f"sink-peer-{unique_id}._sink._tcp.local."
 
 file_hash_cache = {}
+sinkignore_patterns = []
+
+def load_sinkignore():
+    global sinkignore_patterns
+    if SINKIGNORE_FILE.exists():
+        with open(SINKIGNORE_FILE, "r") as f:
+            sinkignore_patterns = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+def is_ignored(filepath):
+    rel_path = str(filepath.relative_to(FOLDER_TO_SYNC)).replace("\\", "/")
+    for pattern in sinkignore_patterns:
+        if fnmatch.fnmatch(rel_path, pattern):
+            return True
+    return False
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -49,6 +65,9 @@ class SyncHandler(FileSystemEventHandler):
             return
 
         file_path = Path(event.src_path)
+        if is_ignored(file_path):
+            return
+
         new_hash = hash_file(file_path)
 
         if file_path.name in file_hash_cache and file_hash_cache[file_path.name] == new_hash:
@@ -68,6 +87,10 @@ app = FastAPI()
 @app.post("/sync")
 async def sync_file(file: UploadFile = File(...)):
     path = FOLDER_TO_SYNC / file.filename
+    if is_ignored(path):
+        print(f"ignored: {file.filename}")
+        return {"status": "ignored"}
+
     path.parent.mkdir(parents=True, exist_ok=True)
     contents = await file.read()
     path.write_bytes(contents)
@@ -78,7 +101,7 @@ async def sync_file(file: UploadFile = File(...)):
 def sync_all_files_to_peer(peer_ip):
     print(f"performing initial sync to peer {peer_ip}")
     for filepath in FOLDER_TO_SYNC.rglob("*"):
-        if filepath.is_file():
+        if filepath.is_file() and not is_ignored(filepath):
             file_name = filepath.name
             local_hash = hash_file(filepath)
             cached_hash = file_hash_cache.get(file_name)
@@ -117,6 +140,7 @@ class SinkPeerListener:
 
 if __name__ == "__main__":
     FOLDER_TO_SYNC.mkdir(exist_ok=True)
+    load_sinkignore()
 
     local_ip = get_local_ip()
     zeroconf = Zeroconf()
