@@ -7,10 +7,11 @@ import hashlib
 import shutil
 import uuid
 from pathlib import Path
+import fnmatch
 
 import requests
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -23,6 +24,68 @@ PEER_PORT = 9191
 SERVICE_TYPE = "_sinklan._tcp.local."
 DEVICE_ID = str(uuid.uuid4())[:8]
 SERVICE_NAME = f"sink-{DEVICE_ID}._sinklan._tcp.local."
+
+SINKIGNORE_PATH = Path(__file__).parent / ".sinkignore"
+ignore_patterns = []
+ignore_lock = threading.Lock()
+
+def load_sinkignore():
+    global ignore_patterns
+    patterns = []
+    if SINKIGNORE_PATH.exists():
+        with open(SINKIGNORE_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                patterns.append(line)
+    with ignore_lock:
+        ignore_patterns[:] = patterns
+    print(f"[sink] Loaded {len(ignore_patterns)} ignore patterns from {SINKIGNORE_PATH}")
+
+def is_ignored(rel_path):
+    rel_path = rel_path.replace("\\", "/")
+    with ignore_lock:
+        patterns = list(ignore_patterns)
+    for pat in patterns:
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+    return False
+
+class SinkIgnoreWatcher(FileSystemEventHandler):
+    def __init__(self, watched_path):
+        self.watched_path = watched_path
+
+    def on_modified(self, event: FileSystemEvent):
+        if Path(event.src_path) == self.watched_path:
+            print("[sink] .sinkignore modified, reloading...")
+            load_sinkignore()
+
+    def on_created(self, event: FileSystemEvent):
+        if Path(event.src_path) == self.watched_path:
+            print("[sink] .sinkignore created, reloading...")
+            load_sinkignore()
+
+    def on_moved(self, event: FileSystemEvent):
+        if Path(event.dest_path) == self.watched_path:
+            print("[sink] .sinkignore moved here, reloading...")
+            load_sinkignore()
+        elif Path(event.src_path) == self.watched_path:
+            print("[sink] .sinkignore moved away, patterns cleared.")
+            load_sinkignore()
+
+    def on_deleted(self, event: FileSystemEvent):
+        if Path(event.src_path) == self.watched_path:
+            print("[sink] .sinkignore deleted, patterns cleared.")
+            load_sinkignore()
+
+def start_sinkignore_watcher():
+    observer = Observer()
+    ignore_handler = SinkIgnoreWatcher(SINKIGNORE_PATH)
+    observer.schedule(ignore_handler, str(SINKIGNORE_PATH.parent), recursive=False)
+    observer.start()
+    return observer
+
 
 known_peers = set()
 peer_lock = threading.Lock()
@@ -87,7 +150,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                 meta = json.loads(self.headers.get("X-Sink-Meta", "{}"))
                 rel_path = meta["rel_path"]
                 filehash = meta["hash"]
-                if is_tempfile(rel_path):
+                if is_tempfile(rel_path) or is_ignored(rel_path):
                     response = {"status": "ignored"}
                 else:
                     dest = abs_path(rel_path)
@@ -103,7 +166,7 @@ class SinkHandler(BaseHTTPRequestHandler):
             elif self.path == "/delete":
                 meta = json.loads(content)
                 rel_path = meta["rel_path"]
-                if is_tempfile(rel_path):
+                if is_tempfile(rel_path) or is_ignored(rel_path):
                     response = {"status": "ignored"}
                 else:
                     dest = abs_path(rel_path)
@@ -115,7 +178,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                 meta = json.loads(content)
                 old = meta["old"]
                 new = meta["new"]
-                if is_tempfile(old) or is_tempfile(new):
+                if is_tempfile(old) or is_tempfile(new) or is_ignored(old) or is_ignored(new):
                     response = {"status": "ignored"}
                 else:
                     src = abs_path(old)
@@ -148,7 +211,7 @@ def initial_sync_to_peer(peer_ip):
         for fname in files:
             absfile = Path(root) / fname
             rel = relative(absfile)
-            if is_tempfile(rel):
+            if is_tempfile(rel) or is_ignored(rel):
                 continue
             try:
                 h = hash_file(absfile)
@@ -168,7 +231,7 @@ def initial_sync_to_peer(peer_ip):
 class PeerListener:
     def __init__(self, local_ip):
         self.local_ip = local_ip
-        self.last_seen = set() 
+        self.last_seen = set()
     def add_service(self, zc, t, name):
         info = zc.get_service_info(t, name)
         if info:
@@ -190,7 +253,7 @@ class PeerListener:
             with peer_lock:
                 if ip in known_peers:
                     known_peers.discard(ip)
-                    print(f"[sink] Peer {ip} left")
+                    print(f"[sink] Disconnected from peer {ip}, searching again...")
     def update_service(self, zc, t, name):
         pass
 
@@ -215,6 +278,8 @@ class SinkEventHandler(FileSystemEventHandler):
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
+        if is_ignored(rel):
+            return
         if rel in loop_suppress:
             loop_suppress.discard(rel)
             return
@@ -230,12 +295,17 @@ class SinkEventHandler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory or is_tempfile(event.src_path):
             return
+        rel = relative(event.src_path)
+        if is_ignored(rel):
+            return
         self.on_modified(event)
 
     def on_deleted(self, event):
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
+        if is_ignored(rel):
+            return
         hash_cache.pop(rel, None)
         delete_on_peers(rel)
 
@@ -244,8 +314,11 @@ class SinkEventHandler(FileSystemEventHandler):
             return
         src_rel = relative(event.src_path)
         dst_rel = relative(event.dest_path)
+        if is_ignored(src_rel) and is_ignored(dst_rel):
+            return
         hash_cache.pop(src_rel, None)
-        hash_cache[dst_rel] = hash_file(event.dest_path) if os.path.isfile(event.dest_path) else None
+        if not is_ignored(dst_rel):
+            hash_cache[dst_rel] = hash_file(event.dest_path) if os.path.isfile(event.dest_path) else None
         rename_on_peers(src_rel, dst_rel)
 
 def start_watcher():
@@ -254,16 +327,10 @@ def start_watcher():
     observer.schedule(event_handler, str(SYNC_FOLDER), recursive=True)
     observer.start()
     print(f"[sink] Watching {SYNC_FOLDER}")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
-
+    return observer
 
 def sync_to_peers(rel_path, abs_path, filehash):
-    if is_tempfile(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
         peers = list(known_peers)
@@ -281,7 +348,7 @@ def sync_to_peers(rel_path, abs_path, filehash):
             print(f"[sink] Sync failed to {peer_ip}: {e}")
 
 def delete_on_peers(rel_path):
-    if is_tempfile(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
         peers = list(known_peers)
@@ -295,7 +362,7 @@ def delete_on_peers(rel_path):
             print(f"[sink] Delete failed to {peer_ip}: {e}")
 
 def rename_on_peers(old, new):
-    if is_tempfile(old) or is_tempfile(new):
+    if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)):
         return
     with peer_lock:
         peers = list(known_peers)
@@ -310,8 +377,13 @@ def rename_on_peers(old, new):
 
 
 if __name__ == "__main__":
+    load_sinkignore()
     print(f"[sink] Sync folder: {SYNC_FOLDER}")
+
     threading.Thread(target=run_http_server, daemon=True).start()
+
+    ignore_observer = start_sinkignore_watcher()
+
     zc = start_discovery()
     print("[sink] Waiting for peers (start a second instance)...")
     for _ in range(60):
@@ -319,5 +391,15 @@ if __name__ == "__main__":
             if known_peers:
                 break
         time.sleep(1)
-    start_watcher()
+
+    folder_observer = start_watcher()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        folder_observer.stop()
+        ignore_observer.stop()
+    folder_observer.join()
+    ignore_observer.join()
     zc.close()
