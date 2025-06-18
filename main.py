@@ -29,6 +29,116 @@ SINKIGNORE_PATH = Path(__file__).parent / ".sinkignore"
 ignore_patterns = []
 ignore_lock = threading.Lock()
 
+def is_tempfile(path):
+    return str(path).endswith('.sinktmp')
+
+def relative(p):
+    return str(Path(p).relative_to(SYNC_FOLDER)).replace("\\", "/")
+
+def abs_path(rel):
+    return (SYNC_FOLDER / rel).resolve()
+
+def hash_file(filepath):
+    try:
+        h = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def is_ignored(rel_path):
+    rel_path = rel_path.replace("\\", "/")
+    with ignore_lock:
+        patterns = list(ignore_patterns)
+    for pat in patterns:
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+    return False
+
+def sync_to_peers(rel_path, abs_path, filehash):
+    if is_tempfile(rel_path) or is_ignored(rel_path):
+        return
+    with peer_lock:
+        peers = list(known_peers)
+    for peer_ip in peers:
+        try:
+            with open(abs_path, "rb") as f:
+                data = f.read()
+            headers = {
+                "X-Sink-Meta": json.dumps({"rel_path": rel_path, "hash": filehash})
+            }
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
+            if r.ok:
+                print(f"[sink] Synced {rel_path} to {peer_ip}")
+        except Exception as e:
+            print(f"[sink] Sync failed to {peer_ip}: {e}")
+
+def delete_on_peers(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path):
+        return
+    with peer_lock:
+        peers = list(known_peers)
+    for peer_ip in peers:
+        try:
+            data = json.dumps({"rel_path": rel_path})
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", data=data, timeout=5)
+            if r.ok:
+                print(f"[sink] Delete sent for {rel_path} to {peer_ip}")
+        except Exception as e:
+            print(f"[sink] Delete failed to {peer_ip}: {e}")
+
+def rename_on_peers(old, new):
+    if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)):
+        return
+    with peer_lock:
+        peers = list(known_peers)
+    for peer_ip in peers:
+        try:
+            data = json.dumps({"old": old, "new": new})
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rename", data=data, timeout=5)
+            if r.ok:
+                print(f"[sink] Rename {old}->{new} sent to {peer_ip}")
+        except Exception as e:
+            print(f"[sink] Rename failed to {peer_ip}: {e}")
+
+def stable_wait(filepath, timeout=3):
+    start = time.time()
+    last = -1
+    while time.time() - start < timeout:
+        try:
+            size = os.path.getsize(filepath)
+        except Exception:
+            return False
+        if size == last:
+            return True
+        last = size
+        time.sleep(0.2)
+    return False
+
+known_peers = set()
+peer_lock = threading.Lock()
+hash_cache = {}
+loop_suppress = set()
+
+def resync_unignored_files():
+    for root, dirs, files in os.walk(SYNC_FOLDER):
+        for fname in files:
+            absfile = Path(root) / fname
+            rel = relative(absfile)
+            if is_tempfile(rel):
+                continue
+            if not is_ignored(rel):
+                h = hash_file(absfile)
+                if hash_cache.get(rel) != h:
+                    hash_cache[rel] = h
+                    sync_to_peers(rel, absfile, h)
+
+
 def load_sinkignore():
     global ignore_patterns
     patterns = []
@@ -42,15 +152,7 @@ def load_sinkignore():
     with ignore_lock:
         ignore_patterns[:] = patterns
     print(f"[sink] Loaded {len(ignore_patterns)} ignore patterns from {SINKIGNORE_PATH}")
-
-def is_ignored(rel_path):
-    rel_path = rel_path.replace("\\", "/")
-    with ignore_lock:
-        patterns = list(ignore_patterns)
-    for pat in patterns:
-        if fnmatch.fnmatch(rel_path, pat):
-            return True
-    return False
+    resync_unignored_files()
 
 class SinkIgnoreWatcher(FileSystemEventHandler):
     def __init__(self, watched_path):
@@ -85,60 +187,6 @@ def start_sinkignore_watcher():
     observer.schedule(ignore_handler, str(SINKIGNORE_PATH.parent), recursive=False)
     observer.start()
     return observer
-
-
-known_peers = set()
-peer_lock = threading.Lock()
-hash_cache = {}
-loop_suppress = set()
-
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
-
-def hash_file(filepath):
-    try:
-        h = hashlib.sha256()
-        with open(filepath, "rb") as f:
-            while True:
-                chunk = f.read(8192)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
-
-def relative(p):
-    return str(Path(p).relative_to(SYNC_FOLDER)).replace("\\", "/")
-
-def abs_path(rel):
-    return (SYNC_FOLDER / rel).resolve()
-
-def stable_wait(filepath, timeout=3):
-    "Wait until file stops changing size, or timeout"
-    start = time.time()
-    last = -1
-    while time.time() - start < timeout:
-        try:
-            size = os.path.getsize(filepath)
-        except Exception:
-            return False
-        if size == last:
-            return True
-        last = size
-        time.sleep(0.2)
-    return False
-
-def is_tempfile(path):
-    return str(path).endswith('.sinktmp')
 
 class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -329,52 +377,16 @@ def start_watcher():
     print(f"[sink] Watching {SYNC_FOLDER}")
     return observer
 
-def sync_to_peers(rel_path, abs_path, filehash):
-    if is_tempfile(rel_path) or is_ignored(rel_path):
-        return
-    with peer_lock:
-        peers = list(known_peers)
-    for peer_ip in peers:
-        try:
-            with open(abs_path, "rb") as f:
-                data = f.read()
-            headers = {
-                "X-Sink-Meta": json.dumps({"rel_path": rel_path, "hash": filehash})
-            }
-            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
-            if r.ok:
-                print(f"[sink] Synced {rel_path} to {peer_ip}")
-        except Exception as e:
-            print(f"[sink] Sync failed to {peer_ip}: {e}")
-
-def delete_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path):
-        return
-    with peer_lock:
-        peers = list(known_peers)
-    for peer_ip in peers:
-        try:
-            data = json.dumps({"rel_path": rel_path})
-            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", data=data, timeout=5)
-            if r.ok:
-                print(f"[sink] Delete sent for {rel_path} to {peer_ip}")
-        except Exception as e:
-            print(f"[sink] Delete failed to {peer_ip}: {e}")
-
-def rename_on_peers(old, new):
-    if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)):
-        return
-    with peer_lock:
-        peers = list(known_peers)
-    for peer_ip in peers:
-        try:
-            data = json.dumps({"old": old, "new": new})
-            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rename", data=data, timeout=5)
-            if r.ok:
-                print(f"[sink] Rename {old}->{new} sent to {peer_ip}")
-        except Exception as e:
-            print(f"[sink] Rename failed to {peer_ip}: {e}")
-
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
 
 if __name__ == "__main__":
     load_sinkignore()
