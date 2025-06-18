@@ -332,12 +332,22 @@ class SinkHandler(BaseHTTPRequestHandler):
                     with open(tmp, "wb") as f:
                         f.write(content)
                     if dest.exists() and files_conflict(dest, tmp):
-                        handle_conflict(rel_path, dest, tmp)
-                    shutil.move(tmp, dest)
-                    hash_cache[rel_path] = filehash
-                    loop_suppress.add(rel_path)
-                    response = {"status": "ok"}
-                    self.log_message(f"Received {rel_path}")
+                        loop_suppress.add(rel_path)
+                        handle_conflict(
+                            rel_path, dest, tmp,
+                            sync_callback=sync_to_peers,
+                            sync_folder=str(SYNC_FOLDER)
+                        )
+                        shutil.move(tmp, dest)
+                        hash_cache[rel_path] = filehash
+                        response = {"status": "ok"}
+                        self.log_message(f"Conflict handled, kept incoming as {rel_path}")
+                    else:
+                        shutil.move(tmp, dest)
+                        hash_cache[rel_path] = filehash
+                        loop_suppress.add(rel_path)
+                        response = {"status": "ok"}
+                        self.log_message(f"Received {rel_path}")
             elif self.path == "/delete":
                 meta = json.loads(content)
                 rel_path = meta["rel_path"]
@@ -542,6 +552,9 @@ class SinkEventHandler(FileSystemEventHandler):
             return
         rel = relative(event.src_path)
         if is_ignored(rel):
+            return
+        if rel in loop_suppress:
+            loop_suppress.discard(rel)
             return
         hash_cache.pop(rel, None)
         delete_on_peers(rel)
