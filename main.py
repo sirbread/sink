@@ -77,11 +77,18 @@ def sync_to_peers(rel_path, abs_path, filehash):
             with open(abs_path, "rb") as f:
                 data = f.read()
             headers = {
-                "X-Sink-Meta": json.dumps({"rel_path": rel_path, "hash": filehash})
+                "X-Sink-Meta": json.dumps({"rel_path": rel_path, "hash": filehash}),
+                "X-Sink-Device-ID": DEVICE_ID,
             }
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
-            if r.ok:
+            if r.status_code == 202:
+                print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
+            elif r.ok:
                 print(f"[sink] Synced {rel_path} to {peer_ip}")
+            elif r.status_code == 403:
+                print(f"[sink] Peer {peer_ip} rejected sync (not trusted by peer).")
+            else:
+                print(f"[sink] Sync failed to {peer_ip} (status: {r.status_code})")
         except Exception as e:
             print(f"[sink] Sync failed to {peer_ip}: {e}")
 
@@ -94,9 +101,16 @@ def delete_on_peers(rel_path):
         peer_ip = peer["ip"]
         try:
             data = json.dumps({"rel_path": rel_path})
-            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", data=data, timeout=5)
-            if r.ok:
+            headers = {"X-Sink-Device-ID": DEVICE_ID}
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", headers=headers, data=data, timeout=5)
+            if r.status_code == 202:
+                print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
+            elif r.ok:
                 print(f"[sink] Delete sent for {rel_path} to {peer_ip}")
+            elif r.status_code == 403:
+                print(f"[sink] Peer {peer_ip} rejected delete (not trusted by peer).")
+            else:
+                print(f"[sink] Delete failed to {peer_ip} (status: {r.status_code})")
         except Exception as e:
             print(f"[sink] Delete failed to {peer_ip}: {e}")
 
@@ -109,9 +123,16 @@ def rename_on_peers(old, new):
         peer_ip = peer["ip"]
         try:
             data = json.dumps({"old": old, "new": new})
-            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rename", data=data, timeout=5)
-            if r.ok:
+            headers = {"X-Sink-Device-ID": DEVICE_ID}
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rename", headers=headers, data=data, timeout=5)
+            if r.status_code == 202:
+                print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
+            elif r.ok:
                 print(f"[sink] Rename {old}->{new} sent to {peer_ip}")
+            elif r.status_code == 403:
+                print(f"[sink] Peer {peer_ip} rejected rename (not trusted by peer).")
+            else:
+                print(f"[sink] Rename failed to {peer_ip} (status: {r.status_code})")
         except Exception as e:
             print(f"[sink] Rename failed to {peer_ip}: {e}")
 
@@ -199,6 +220,24 @@ def start_sinkignore_watcher():
 
 class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        device_id = self.headers.get("X-Sink-Device-ID")
+        if not device_id:
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "forbidden", "reason": "Device ID header missing"}).encode())
+            return
+
+        if not is_device_trusted(device_id):
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "pending",
+                "reason": "Device not yet authorized. Authorize on this device to proceed."
+            }).encode())
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         content = self.rfile.read(length)
         response = {"status": "error"}
@@ -257,6 +296,17 @@ class SinkHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(response).encode())
 
+    def do_GET(self):
+        if self.path == "/device_id":
+            response = {"device_id": DEVICE_ID, "device_name": socket.gethostname()}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
 def run_http_server():
     server = HTTPServer(("0.0.0.0", PEER_PORT), SinkHandler)
     print(f"[sink] HTTP server listening on {PEER_PORT}")
@@ -272,42 +322,45 @@ def get_peer_device_id(ip):
         pass
     return "", ip
 
-def device_id_endpoint():
-    class DeviceIDHandler(SinkHandler):
-        def do_GET(self):
-            if self.path == "/device_id":
-                response = {"device_id": DEVICE_ID, "device_name": socket.gethostname()}
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode())
-            else:
-                super().do_GET()
-    return DeviceIDHandler
-
 def initial_sync_to_peer(peer_ip, peer_id, peer_name):
-
-    print(f"[sink] Performing initial sync to {peer_ip} ...")
+    print(f"[sink] Attempting initial sync to {peer_ip} ...")
+    synced_any = False
+    any_candidate = False
     for root, dirs, files in os.walk(SYNC_FOLDER):
         for fname in files:
             absfile = Path(root) / fname
             rel = relative(absfile)
             if is_tempfile(rel) or is_ignored(rel):
                 continue
+            any_candidate = True
             try:
                 h = hash_file(absfile)
                 with open(absfile, "rb") as f:
                     data = f.read()
                 headers = {
-                    "X-Sink-Meta": json.dumps({"rel_path": rel, "hash": h})
+                    "X-Sink-Meta": json.dumps({"rel_path": rel, "hash": h}),
+                    "X-Sink-Device-ID": DEVICE_ID,
                 }
                 r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
+                if r.status_code == 202:
+                    print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
+                    return
+                if r.status_code in (401, 403):
+                    print(f"[sink] Peer {peer_ip} rejected sync ({r.status_code}: not authorized or not trusted).")
+                    return
                 if r.ok:
                     print(f"[sink]   Synced {rel} to {peer_ip}")
+                    synced_any = True
                 else:
-                    print(f"[sink]   Failed to sync {rel} to {peer_ip}")
+                    print(f"[sink]   Failed to sync {rel} to {peer_ip} (status: {r.status_code})")
             except Exception as e:
                 print(f"[sink]   Error syncing {rel} to {peer_ip}: {e}")
+    if synced_any:
+        print(f"[sink] Initial sync to {peer_ip} complete.")
+    elif any_candidate:
+        print(f"[sink] No files were synced to {peer_ip}. Peer may require authorization or trust you back.")
+    else:
+        print(f"[sink] No files to sync to {peer_ip}.")
 
 class PeerListener:
     def __init__(self, local_ip, trusted_only=False, prompt_on_new=True):
@@ -332,6 +385,10 @@ class PeerListener:
             if not trusted:
                 if not add_trusted_device(peer_id, peer_name, ip, prompt=self.prompt_on_new):
                     return
+                print(f"[sink] Device '{peer_id}' trusted.")
+                if peer_id in known_peers:
+                    print(f"[sink] Now mutually trusted with {ip} ({peer_id}), triggering initial sync.")
+                    threading.Thread(target=initial_sync_to_peer, args=(ip, peer_id, peer_name), daemon=True).start()
             else:
                 update_device_ip(peer_id, ip)
             peer_obj = {"ip": ip, "device_id": peer_id, "name": peer_name}
@@ -438,11 +495,6 @@ def get_local_ip():
         s.close()
     return ip
 
-def run_http_server_with_device_id():
-    server = HTTPServer(("0.0.0.0", PEER_PORT), device_id_endpoint())
-    print(f"[sink] HTTP server listening on {PEER_PORT}")
-    server.serve_forever()
-
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="sink file sync")
@@ -452,7 +504,7 @@ if __name__ == "__main__":
 
     load_sinkignore()
     print(f"[sink] Sync folder: {SYNC_FOLDER}")
-    threading.Thread(target=run_http_server_with_device_id, daemon=True).start()
+    threading.Thread(target=run_http_server, daemon=True).start()
     ignore_observer = start_sinkignore_watcher()
     zc = start_discovery(trusted_only=args.trusted_only, prompt_on_new=not args.no_prompt)
     print("[sink] Waiting for peers (start a second instance)...")
