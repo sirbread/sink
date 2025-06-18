@@ -17,16 +17,23 @@ def save_trusted_devices(devices):
     with open(DEVICES_FILE, "w") as f:
         json.dump({"trusted_devices": list(devices.values())}, f, indent=2)
 
-def add_trusted_device(device_id, name, ip, prompt=False):
+def add_trusted_device(device_id, name, ip, prompt=False, notify_func=None):
     devices = load_trusted_devices()
     if device_id not in devices:
         if prompt:
             resp = input(f"[sink] New device '{device_id}' ({name}) at {ip} discovered. Trust this device? [Y/n] ").strip().lower()
             if resp and resp.startswith("n"):
                 print(f"[sink] Device '{device_id}' not trusted, will ignore.")
+                if notify_func:
+                    notify_func(ip, device_id, "reject")
                 return False
+            else:
+                if notify_func:
+                    notify_func(ip, device_id, "accept")
         else:
             print(f"[sink] Trusting new device: {device_id} ({name}) at {ip}")
+            if notify_func:
+                notify_func(ip, device_id, "accept")
     devices[device_id] = {"device_id": device_id, "name": name, "last_ip": ip}
     save_trusted_devices(devices)
     return True

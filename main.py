@@ -66,6 +66,30 @@ def is_ignored(rel_path):
             return True
     return False
 
+peer_status = {}
+
+def update_peer_status(peer_ip, status):
+    last_status = peer_status.get(peer_ip)
+    if status != last_status:
+        if status == "accepted":
+            print(f"[sink] Other device {peer_ip} has accepted your device!")
+        elif status == "rejected":
+            print(f"[sink] Other device {peer_ip} has rejected your device!")
+        elif status == "pending":
+            print(f"[sink] Waiting for authorization from other device {peer_ip}...")
+        peer_status[peer_ip] = status
+
+def notify_peer_trust(peer_ip, peer_id, action):
+    try:
+        requests.post(
+            f"http://{peer_ip}:{PEER_PORT}/trust-notify",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps({"action": action, "peer_id": DEVICE_ID}),
+            timeout=3
+        )
+    except Exception as e:
+        print(f"[sink] Failed to notify peer {peer_ip} of trust action: {e}")
+
 def sync_to_peers(rel_path, abs_path, filehash):
     if is_tempfile(rel_path) or is_ignored(rel_path):
         return
@@ -82,10 +106,13 @@ def sync_to_peers(rel_path, abs_path, filehash):
             }
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
             if r.status_code == 202:
+                update_peer_status(peer_ip, "pending")
                 print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
             elif r.ok:
+                update_peer_status(peer_ip, "accepted")
                 print(f"[sink] Synced {rel_path} to {peer_ip}")
             elif r.status_code == 403:
+                update_peer_status(peer_ip, "rejected")
                 print(f"[sink] Peer {peer_ip} rejected sync (not trusted by peer).")
             else:
                 print(f"[sink] Sync failed to {peer_ip} (status: {r.status_code})")
@@ -104,10 +131,13 @@ def delete_on_peers(rel_path):
             headers = {"X-Sink-Device-ID": DEVICE_ID}
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", headers=headers, data=data, timeout=5)
             if r.status_code == 202:
+                update_peer_status(peer_ip, "pending")
                 print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
             elif r.ok:
+                update_peer_status(peer_ip, "accepted")
                 print(f"[sink] Delete sent for {rel_path} to {peer_ip}")
             elif r.status_code == 403:
+                update_peer_status(peer_ip, "rejected")
                 print(f"[sink] Peer {peer_ip} rejected delete (not trusted by peer).")
             else:
                 print(f"[sink] Delete failed to {peer_ip} (status: {r.status_code})")
@@ -126,10 +156,13 @@ def rename_on_peers(old, new):
             headers = {"X-Sink-Device-ID": DEVICE_ID}
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rename", headers=headers, data=data, timeout=5)
             if r.status_code == 202:
+                update_peer_status(peer_ip, "pending")
                 print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
             elif r.ok:
+                update_peer_status(peer_ip, "accepted")
                 print(f"[sink] Rename {old}->{new} sent to {peer_ip}")
             elif r.status_code == 403:
+                update_peer_status(peer_ip, "rejected")
                 print(f"[sink] Peer {peer_ip} rejected rename (not trusted by peer).")
             else:
                 print(f"[sink] Rename failed to {peer_ip} (status: {r.status_code})")
@@ -221,6 +254,26 @@ def start_sinkignore_watcher():
 class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         device_id = self.headers.get("X-Sink-Device-ID")
+        if self.path == "/trust-notify":
+            length = int(self.headers.get("Content-Length", 0))
+            content = self.rfile.read(length)
+            try:
+                data = json.loads(content)
+                action = data.get("action")
+                peer_id = data.get("peer_id")
+                if action == "accept":
+                    print(f"[sink] Other device has accepted your device (peer_id={peer_id})!")
+                elif action == "reject":
+                    print(f"[sink] Other device has rejected your device (peer_id={peer_id})!")
+                else:
+                    print(f"[sink] Received unknown trust action: {action} from peer {peer_id}")
+                self.send_response(200)
+                self.end_headers()
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+            return
+
         if not device_id:
             self.send_response(403)
             self.send_header("Content-Type", "application/json")
@@ -229,6 +282,7 @@ class SinkHandler(BaseHTTPRequestHandler):
             return
 
         if not is_device_trusted(device_id):
+            print(f"[sink] Device '{device_id}' not trusted, received {self.path} request and returned pending (202).")
             self.send_response(202)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -343,12 +397,15 @@ def initial_sync_to_peer(peer_ip, peer_id, peer_name):
                 }
                 r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
                 if r.status_code == 202:
+                    update_peer_status(peer_ip, "pending")
                     print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
                     return
                 if r.status_code in (401, 403):
+                    update_peer_status(peer_ip, "rejected")
                     print(f"[sink] Peer {peer_ip} rejected sync ({r.status_code}: not authorized or not trusted).")
                     return
                 if r.ok:
+                    update_peer_status(peer_ip, "accepted")
                     print(f"[sink]   Synced {rel} to {peer_ip}")
                     synced_any = True
                 else:
@@ -383,7 +440,7 @@ class PeerListener:
                 print(f"[sink] Device '{peer_id}' at {ip} not trusted, ignoring (trusted-only mode).")
                 return
             if not trusted:
-                if not add_trusted_device(peer_id, peer_name, ip, prompt=self.prompt_on_new):
+                if not add_trusted_device(peer_id, peer_name, ip, prompt=self.prompt_on_new, notify_func=notify_peer_trust):
                     return
                 print(f"[sink] Device '{peer_id}' trusted.")
                 if peer_id in known_peers:
