@@ -17,6 +17,12 @@ from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 
+from auth import (
+    add_trusted_device,
+    is_device_trusted,
+    update_device_ip,
+    get_trusted_devices,
+)
 
 SYNC_FOLDER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd() / "sync"
 SYNC_FOLDER.mkdir(exist_ok=True)
@@ -64,8 +70,9 @@ def sync_to_peers(rel_path, abs_path, filehash):
     if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
-        peers = list(known_peers)
-    for peer_ip in peers:
+        peers = list(known_peers.values())
+    for peer in peers:
+        peer_ip = peer["ip"]
         try:
             with open(abs_path, "rb") as f:
                 data = f.read()
@@ -82,8 +89,9 @@ def delete_on_peers(rel_path):
     if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
-        peers = list(known_peers)
-    for peer_ip in peers:
+        peers = list(known_peers.values())
+    for peer in peers:
+        peer_ip = peer["ip"]
         try:
             data = json.dumps({"rel_path": rel_path})
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", data=data, timeout=5)
@@ -96,8 +104,9 @@ def rename_on_peers(old, new):
     if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)):
         return
     with peer_lock:
-        peers = list(known_peers)
-    for peer_ip in peers:
+        peers = list(known_peers.values())
+    for peer in peers:
+        peer_ip = peer["ip"]
         try:
             data = json.dumps({"old": old, "new": new})
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rename", data=data, timeout=5)
@@ -120,7 +129,7 @@ def stable_wait(filepath, timeout=3):
         time.sleep(0.2)
     return False
 
-known_peers = set()
+known_peers = {}
 peer_lock = threading.Lock()
 hash_cache = {}
 loop_suppress = set()
@@ -253,7 +262,31 @@ def run_http_server():
     print(f"[sink] HTTP server listening on {PEER_PORT}")
     server.serve_forever()
 
-def initial_sync_to_peer(peer_ip):
+def get_peer_device_id(ip):
+    try:
+        r = requests.get(f"http://{ip}:{PEER_PORT}/device_id", timeout=3)
+        if r.ok:
+            resp = r.json()
+            return resp.get("device_id", ""), resp.get("device_name", ip)
+    except Exception:
+        pass
+    return "", ip
+
+def device_id_endpoint():
+    class DeviceIDHandler(SinkHandler):
+        def do_GET(self):
+            if self.path == "/device_id":
+                response = {"device_id": DEVICE_ID, "device_name": socket.gethostname()}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(response).encode())
+            else:
+                super().do_GET()
+    return DeviceIDHandler
+
+def initial_sync_to_peer(peer_ip, peer_id, peer_name):
+
     print(f"[sink] Performing initial sync to {peer_ip} ...")
     for root, dirs, files in os.walk(SYNC_FOLDER):
         for fname in files:
@@ -277,35 +310,52 @@ def initial_sync_to_peer(peer_ip):
                 print(f"[sink]   Error syncing {rel} to {peer_ip}: {e}")
 
 class PeerListener:
-    def __init__(self, local_ip):
+    def __init__(self, local_ip, trusted_only=False, prompt_on_new=True):
         self.local_ip = local_ip
         self.last_seen = set()
+        self.trusted_only = trusted_only
+        self.prompt_on_new = prompt_on_new
     def add_service(self, zc, t, name):
         info = zc.get_service_info(t, name)
         if info:
             ip = socket.inet_ntoa(info.addresses[0])
-            if ip != self.local_ip:
-                first_time = False
-                with peer_lock:
-                    if ip not in known_peers:
-                        known_peers.add(ip)
-                        first_time = True
-                if first_time or ip not in self.last_seen:
-                    print(f"[sink] Found new peer: {ip}")
-                    threading.Thread(target=initial_sync_to_peer, args=(ip,), daemon=True).start()
-                self.last_seen.add(ip)
+            if ip == self.local_ip:
+                return
+            peer_id, peer_name = get_peer_device_id(ip)
+            if not peer_id:
+                print(f"[sink] Could not get device ID from {ip}, skipping.")
+                return
+            trusted = is_device_trusted(peer_id)
+            if self.trusted_only and not trusted:
+                print(f"[sink] Device '{peer_id}' at {ip} not trusted, ignoring (trusted-only mode).")
+                return
+            if not trusted:
+                if not add_trusted_device(peer_id, peer_name, ip, prompt=self.prompt_on_new):
+                    return
+            else:
+                update_device_ip(peer_id, ip)
+            peer_obj = {"ip": ip, "device_id": peer_id, "name": peer_name}
+            with peer_lock:
+                known_peers[peer_id] = peer_obj
+            print(f"[sink] Found new peer: {ip} ({peer_id})")
+            threading.Thread(target=initial_sync_to_peer, args=(ip, peer_id, peer_name), daemon=True).start()
     def remove_service(self, zc, t, name):
         info = zc.get_service_info(t, name)
         if info:
             ip = socket.inet_ntoa(info.addresses[0])
+            did = None
             with peer_lock:
-                if ip in known_peers:
-                    known_peers.discard(ip)
-                    print(f"[sink] Disconnected from peer {ip}, searching again...")
+                for k, v in list(known_peers.items()):
+                    if v["ip"] == ip:
+                        did = k
+                        del known_peers[k]
+                        print(f"[sink] Disconnected from peer {ip} ({did}), searching again...")
+                        break
+
     def update_service(self, zc, t, name):
         pass
 
-def start_discovery():
+def start_discovery(trusted_only=False, prompt_on_new=True):
     zeroconf = Zeroconf()
     info = ServiceInfo(
         SERVICE_TYPE,
@@ -316,7 +366,7 @@ def start_discovery():
         server=socket.gethostname() + ".local."
     )
     zeroconf.register_service(info)
-    listener = PeerListener(get_local_ip())
+    listener = PeerListener(get_local_ip(), trusted_only=trusted_only, prompt_on_new=prompt_on_new)
     ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
     print("[sink] Zeroconf service running")
     return zeroconf
@@ -388,15 +438,23 @@ def get_local_ip():
         s.close()
     return ip
 
+def run_http_server_with_device_id():
+    server = HTTPServer(("0.0.0.0", PEER_PORT), device_id_endpoint())
+    print(f"[sink] HTTP server listening on {PEER_PORT}")
+    server.serve_forever()
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="sink file sync")
+    parser.add_argument("--trusted-only", action="store_true", help="Only sync with trusted devices")
+    parser.add_argument("--no-prompt", action="store_true", help="Do not prompt for new devices, always trust")
+    args = parser.parse_args()
+
     load_sinkignore()
     print(f"[sink] Sync folder: {SYNC_FOLDER}")
-
-    threading.Thread(target=run_http_server, daemon=True).start()
-
+    threading.Thread(target=run_http_server_with_device_id, daemon=True).start()
     ignore_observer = start_sinkignore_watcher()
-
-    zc = start_discovery()
+    zc = start_discovery(trusted_only=args.trusted_only, prompt_on_new=not args.no_prompt)
     print("[sink] Waiting for peers (start a second instance)...")
     for _ in range(60):
         with peer_lock:
