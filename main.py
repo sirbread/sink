@@ -24,6 +24,8 @@ from auth import (
     get_trusted_devices,
 )
 
+from conflict import files_conflict, handle_conflict
+
 SYNC_FOLDER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd() / "sync"
 SYNC_FOLDER.mkdir(exist_ok=True)
 PEER_PORT = 9191
@@ -329,6 +331,8 @@ class SinkHandler(BaseHTTPRequestHandler):
                     tmp = dest.parent / (dest.name + ".sinktmp")
                     with open(tmp, "wb") as f:
                         f.write(content)
+                    if dest.exists() and files_conflict(dest, tmp):
+                        handle_conflict(rel_path, dest, tmp)
                     shutil.move(tmp, dest)
                     hash_cache[rel_path] = filehash
                     loop_suppress.add(rel_path)
