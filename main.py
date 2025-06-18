@@ -67,6 +67,7 @@ def is_ignored(rel_path):
     return False
 
 peer_status = {}
+trusted_by_devices = set()
 
 def update_peer_status(peer_ip, status):
     last_status = peer_status.get(peer_ip)
@@ -89,6 +90,22 @@ def notify_peer_trust(peer_ip, peer_id, action):
         )
     except Exception as e:
         print(f"[sink] Failed to notify peer {peer_ip} of trust action: {e}")
+
+def is_mutual_trust(peer_id):
+    return is_device_trusted(peer_id) and (peer_id in trusted_by_devices)
+
+def try_initial_sync(peer_id):
+    if is_mutual_trust(peer_id):
+        peer_ip = None
+        peer_name = None
+        with peer_lock:
+            for v in known_peers.values():
+                if v["device_id"] == peer_id:
+                    peer_ip = v["ip"]
+                    peer_name = v["name"]
+                    break
+        if peer_ip:
+            threading.Thread(target=initial_sync_to_peer, args=(peer_ip, peer_id, peer_name), daemon=True).start()
 
 def sync_to_peers(rel_path, abs_path, filehash):
     if is_tempfile(rel_path) or is_ignored(rel_path):
@@ -263,8 +280,12 @@ class SinkHandler(BaseHTTPRequestHandler):
                 peer_id = data.get("peer_id")
                 if action == "accept":
                     print(f"[sink] Other device has accepted your device (peer_id={peer_id})!")
+                    trusted_by_devices.add(peer_id)
+                    try_initial_sync(peer_id)
                 elif action == "reject":
                     print(f"[sink] Other device has rejected your device (peer_id={peer_id})!")
+                    if peer_id in trusted_by_devices:
+                        trusted_by_devices.remove(peer_id)
                 else:
                     print(f"[sink] Received unknown trust action: {action} from peer {peer_id}")
                 self.send_response(200)
@@ -443,16 +464,16 @@ class PeerListener:
                 if not add_trusted_device(peer_id, peer_name, ip, prompt=self.prompt_on_new, notify_func=notify_peer_trust):
                     return
                 print(f"[sink] Device '{peer_id}' trusted.")
-                if peer_id in known_peers:
-                    print(f"[sink] Now mutually trusted with {ip} ({peer_id}), triggering initial sync.")
-                    threading.Thread(target=initial_sync_to_peer, args=(ip, peer_id, peer_name), daemon=True).start()
+                if peer_id in trusted_by_devices:
+                    try_initial_sync(peer_id)
             else:
                 update_device_ip(peer_id, ip)
             peer_obj = {"ip": ip, "device_id": peer_id, "name": peer_name}
             with peer_lock:
                 known_peers[peer_id] = peer_obj
             print(f"[sink] Found new peer: {ip} ({peer_id})")
-            threading.Thread(target=initial_sync_to_peer, args=(ip, peer_id, peer_name), daemon=True).start()
+            if is_mutual_trust(peer_id):
+                try_initial_sync(peer_id)
     def remove_service(self, zc, t, name):
         info = zc.get_service_info(t, name)
         if info:
