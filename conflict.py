@@ -37,8 +37,8 @@ def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name
     rel_filename = Path(rel_path).name
     timestamp = int(time.time())
 
-    local_conflict_file = local_conflict_dir / f"{rel_filename}.{timestamp}"
-    remote_conflict_file = remote_conflict_dir / f"{rel_filename}.{timestamp}"
+    local_conflict_file = local_conflict_dir / f"{timestamp}.{rel_filename}"
+    remote_conflict_file = remote_conflict_dir / f"{timestamp}.{rel_filename}"
 
     if Path(local_path).exists():
         shutil.move(str(local_path), str(local_conflict_file))

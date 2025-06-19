@@ -24,7 +24,7 @@ from auth import (
     get_trusted_devices,
 )
 
-from conflict import file_hash, files_conflict, get_device_name, handle_conflict
+from conflict import files_conflict, handle_conflict
 
 SYNC_FOLDER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd() / "sync"
 SYNC_FOLDER.mkdir(exist_ok=True)
@@ -68,6 +68,10 @@ def is_ignored(rel_path):
             return True
     return False
 
+def is_conflict_file(rel_path):
+    parts = Path(rel_path).parts
+    return len(parts) > 0 and parts[0] == ".sink_conflicts"
+
 peer_status = {}
 trusted_by_devices = set()
 
@@ -110,7 +114,7 @@ def try_initial_sync(peer_id):
             threading.Thread(target=initial_sync_to_peer, args=(peer_ip, peer_id, peer_name), daemon=True).start()
 
 def sync_to_peers(rel_path, abs_path, filehash):
-    if is_tempfile(rel_path) or is_ignored(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -140,7 +144,7 @@ def sync_to_peers(rel_path, abs_path, filehash):
             print(f"[sink] Sync failed to {peer_ip}: {e}")
 
 def delete_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -165,7 +169,7 @@ def delete_on_peers(rel_path):
             print(f"[sink] Delete failed to {peer_ip}: {e}")
 
 def rename_on_peers(old, new):
-    if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)):
+    if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)) or is_conflict_file(old) or is_conflict_file(new):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -215,7 +219,7 @@ def resync_unignored_files():
             rel = relative(absfile)
             if is_tempfile(rel):
                 continue
-            if not is_ignored(rel):
+            if not is_ignored(rel) and not is_conflict_file(rel):
                 h = hash_file(absfile)
                 if hash_cache.get(rel) != h:
                     hash_cache[rel] = h
@@ -324,7 +328,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                 meta = json.loads(self.headers.get("X-Sink-Meta", "{}"))
                 rel_path = meta["rel_path"]
                 filehash = meta["hash"]
-                if is_tempfile(rel_path) or is_ignored(rel_path):
+                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
                     response = {"status": "ignored"}
                 else:
                     dest = abs_path(rel_path)
@@ -332,19 +336,27 @@ class SinkHandler(BaseHTTPRequestHandler):
                     tmp = dest.parent / (dest.name + ".sinktmp")
                     with open(tmp, "wb") as f:
                         f.write(content)
+                    my_name = socket.gethostname()
+                    leader = min(my_name, remote_device_name)
                     if dest.exists() and files_conflict(dest, tmp):
-                        loop_suppress.add(rel_path)
-                        handle_conflict(
-                            rel_path, dest, tmp,
-                            remote_device_name=remote_device_name,
-                            sync_callback=sync_to_peers,
-                            sync_folder=str(SYNC_FOLDER)
-                        )
-                        if dest.exists():
-                            dest.unlink()
-                        hash_cache.pop(rel_path, None)
-                        response = {"status": "conflict"}
-                        self.log_message(f"Conflict handled: both versions moved to .sink_conflicts")
+                        if my_name == leader:
+                            loop_suppress.add(rel_path)
+                            handle_conflict(
+                                rel_path, dest, tmp,
+                                remote_device_name=remote_device_name,
+                                sync_callback=sync_to_peers,
+                                sync_folder=str(SYNC_FOLDER)
+                            )
+                            if dest.exists():
+                                dest.unlink()
+                            hash_cache.pop(rel_path, None)
+                            response = {"status": "conflict"}
+                            self.log_message(f"Conflict handled: both versions moved to .sink_conflicts")
+                        else:
+                            if tmp.exists():
+                                tmp.unlink()
+                            response = {"status": "conflict-ignored"}
+                            self.log_message(f"Conflict detected but not handled (not leader)")
                     else:
                         shutil.move(tmp, dest)
                         hash_cache[rel_path] = filehash
@@ -354,7 +366,7 @@ class SinkHandler(BaseHTTPRequestHandler):
             elif self.path == "/delete":
                 meta = json.loads(content)
                 rel_path = meta["rel_path"]
-                if is_tempfile(rel_path) or is_ignored(rel_path):
+                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
                     response = {"status": "ignored"}
                 else:
                     dest = abs_path(rel_path)
@@ -366,7 +378,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                 meta = json.loads(content)
                 old = meta["old"]
                 new = meta["new"]
-                if is_tempfile(old) or is_tempfile(new) or is_ignored(old) or is_ignored(new):
+                if is_tempfile(old) or is_tempfile(new) or is_ignored(old) or is_ignored(new) or is_conflict_file(old) or is_conflict_file(new):
                     response = {"status": "ignored"}
                 else:
                     src = abs_path(old)
@@ -422,7 +434,7 @@ def initial_sync_to_peer(peer_ip, peer_id, peer_name):
         for fname in files:
             absfile = Path(root) / fname
             rel = relative(absfile)
-            if is_tempfile(rel) or is_ignored(rel):
+            if is_tempfile(rel) or is_ignored(rel) or is_conflict_file(rel):
                 continue
             any_candidate = True
             try:
@@ -529,7 +541,7 @@ class SinkEventHandler(FileSystemEventHandler):
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
-        if is_ignored(rel):
+        if is_ignored(rel) or is_conflict_file(rel):
             return
         if rel in loop_suppress:
             loop_suppress.discard(rel)
@@ -547,7 +559,7 @@ class SinkEventHandler(FileSystemEventHandler):
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
-        if is_ignored(rel):
+        if is_ignored(rel) or is_conflict_file(rel):
             return
         self.on_modified(event)
 
@@ -555,7 +567,7 @@ class SinkEventHandler(FileSystemEventHandler):
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
-        if is_ignored(rel):
+        if is_ignored(rel) or is_conflict_file(rel):
             return
         if rel in loop_suppress:
             loop_suppress.discard(rel)
@@ -568,10 +580,10 @@ class SinkEventHandler(FileSystemEventHandler):
             return
         src_rel = relative(event.src_path)
         dst_rel = relative(event.dest_path)
-        if is_ignored(src_rel) and is_ignored(dst_rel):
+        if (is_ignored(src_rel) and is_ignored(dst_rel)) or (is_conflict_file(src_rel) and is_conflict_file(dst_rel)):
             return
         hash_cache.pop(src_rel, None)
-        if not is_ignored(dst_rel):
+        if not is_ignored(dst_rel) and not is_conflict_file(dst_rel):
             hash_cache[dst_rel] = hash_file(event.dest_path) if os.path.isfile(event.dest_path) else None
         rename_on_peers(src_rel, dst_rel)
 
