@@ -24,7 +24,7 @@ from auth import (
     get_trusted_devices,
 )
 
-from conflict import files_conflict
+from conflict import file_hash, files_conflict, get_device_name, handle_conflict
 
 SYNC_FOLDER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd() / "sync"
 SYNC_FOLDER.mkdir(exist_ok=True)
@@ -36,13 +36,6 @@ SERVICE_NAME = f"sink-{DEVICE_ID}._sinklan._tcp.local."
 SINKIGNORE_PATH = Path(__file__).parent / ".sinkignore"
 ignore_patterns = []
 ignore_lock = threading.Lock()
-
-# State for sync
-known_peers = {}
-peer_lock = threading.Lock()
-hash_cache = {}
-loop_suppress = set()
-ready_for_sync = False
 
 def is_tempfile(path):
     return str(path).endswith('.sinktmp')
@@ -74,116 +67,6 @@ def is_ignored(rel_path):
         if fnmatch.fnmatch(rel_path, pat):
             return True
     return False
-
-PRIORITY_FILE = SYNC_FOLDER / ".sink_priority"
-priority_device_id = None
-priority_device_name = None
-
-def load_priority():
-    global priority_device_id, priority_device_name
-    if PRIORITY_FILE.exists():
-        with open(PRIORITY_FILE, "r") as f:
-            data = json.load(f)
-            priority_device_id = data.get("priority_device_id")
-            priority_device_name = data.get("priority_device_name")
-        return True
-    return False
-
-def save_priority(priority_id, priority_name):
-    data = {
-        "priority_device_id": priority_id,
-        "priority_device_name": priority_name,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    }
-    with open(PRIORITY_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-def wipe_priority():
-    if PRIORITY_FILE.exists():
-        try:
-            PRIORITY_FILE.unlink()
-            print("[sink] Wiped .sink_priority on exit.")
-        except Exception as e:
-            print(f"[sink] Failed to wipe .sink_priority: {e}")
-
-def prompt_for_priority(local_name, local_id, peer_name, peer_id):
-    print("Which device should have priority for this sync folder?")
-    print(f"1) This device: {local_name} ({local_id})")
-    print(f"2) Peer device: {peer_name} ({peer_id})")
-    while True:
-        selection = input("Enter 1 or 2: ").strip()
-        if selection == "1":
-            return local_id
-        elif selection == "2":
-            return peer_id
-        else:
-            print("Invalid, enter 1 or 2.")
-
-def announce_priority_to_peer(peer_ip, chosen_id, chosen_name):
-    try:
-        payload = {
-            "priority_device_id": chosen_id,
-            "priority_device_name": chosen_name,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        }
-        r = requests.post(f"http://{peer_ip}:{PEER_PORT}/priority", json=payload, timeout=5)
-        return r.ok
-    except Exception as e:
-        print(f"[sink] Failed to announce priority to peer: {e}")
-        return False
-
-def get_mutual_peer():
-    while True:
-        with peer_lock:
-            peers = [p for p in known_peers.values() if is_mutual_trust(p["device_id"])]
-        if peers:
-            peer = peers[0]
-            print(f"[sink] Discovered mutual peer: {peer['name']} ({peer['device_id']}) at {peer['ip']}")
-            return peer["name"], peer["device_id"], peer["ip"]
-        time.sleep(2)
-
-def ensure_priority(peer_name, peer_id, peer_ip):
-    local_has_priority = load_priority()
-    local_name = socket.gethostname()
-    local_id = DEVICE_ID
-    if local_has_priority:
-        announce_priority_to_peer(peer_ip, priority_device_id, priority_device_name)
-        print(f"[sink] Priority already set: {priority_device_id} ({priority_device_name}). Announced to peer.")
-        return
-    chosen_id = prompt_for_priority(local_name, local_id, peer_name, peer_id)
-    if chosen_id == local_id:
-        chosen_name = local_name
-    else:
-        chosen_name = peer_name
-    save_priority(chosen_id, chosen_name)
-    announce_priority_to_peer(peer_ip, chosen_id, chosen_name)
-    print(f"[sink] Priority set: {chosen_id} ({chosen_name})")
-
-def resolve_conflict(rel_path, local_path, incoming_temp_path):
-    if not load_priority():
-        print("[sink] ERROR: Priority not set! Cannot resolve conflict.")
-        return
-    if priority_device_id == DEVICE_ID:
-        conflict_dir = local_path.parent / ".sink_conflicts"
-        conflict_dir.mkdir(exist_ok=True)
-        timestamp = int(time.time())
-        new_name = f"{local_path.name}.conflict.{timestamp}"
-        new_path = conflict_dir / new_name
-        shutil.move(str(incoming_temp_path), str(new_path))
-        print(f"[sink] CONFLICT: Kept local file, moved incoming to {new_path}")
-    else:
-        conflict_dir = local_path.parent / ".sink_conflicts"
-        conflict_dir.mkdir(exist_ok=True)
-        timestamp = int(time.time())
-        new_name = f"{local_path.name}.conflict.{timestamp}"
-        new_path = conflict_dir / new_name
-        shutil.move(str(local_path), str(new_path))
-        shutil.move(str(incoming_temp_path), str(local_path))
-        print(f"[sink] CONFLICT: Replaced local with incoming, local moved to {new_path}")
-
-def setup_phase_priority():
-    peer_name, peer_id, peer_ip = get_mutual_peer()
-    ensure_priority(peer_name, peer_id, peer_ip)
 
 peer_status = {}
 trusted_by_devices = set()
@@ -227,8 +110,6 @@ def try_initial_sync(peer_id):
             threading.Thread(target=initial_sync_to_peer, args=(peer_ip, peer_id, peer_name), daemon=True).start()
 
 def sync_to_peers(rel_path, abs_path, filehash):
-    if not ready_for_sync:
-        return
     if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
@@ -241,6 +122,7 @@ def sync_to_peers(rel_path, abs_path, filehash):
             headers = {
                 "X-Sink-Meta": json.dumps({"rel_path": rel_path, "hash": filehash}),
                 "X-Sink-Device-ID": DEVICE_ID,
+                "X-Sink-Device-Name": socket.gethostname()
             }
             r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
             if r.status_code == 202:
@@ -258,8 +140,6 @@ def sync_to_peers(rel_path, abs_path, filehash):
             print(f"[sink] Sync failed to {peer_ip}: {e}")
 
 def delete_on_peers(rel_path):
-    if not ready_for_sync:
-        return
     if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
@@ -285,8 +165,6 @@ def delete_on_peers(rel_path):
             print(f"[sink] Delete failed to {peer_ip}: {e}")
 
 def rename_on_peers(old, new):
-    if not ready_for_sync:
-        return
     if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)):
         return
     with peer_lock:
@@ -311,9 +189,26 @@ def rename_on_peers(old, new):
         except Exception as e:
             print(f"[sink] Rename failed to {peer_ip}: {e}")
 
+def stable_wait(filepath, timeout=3):
+    start = time.time()
+    last = -1
+    while time.time() - start < timeout:
+        try:
+            size = os.path.getsize(filepath)
+        except Exception:
+            return False
+        if size == last:
+            return True
+        last = size
+        time.sleep(0.2)
+    return False
+
+known_peers = {}
+peer_lock = threading.Lock()
+hash_cache = {}
+loop_suppress = set()
+
 def resync_unignored_files():
-    if not ready_for_sync:
-        return
     for root, dirs, files in os.walk(SYNC_FOLDER):
         for fname in files:
             absfile = Path(root) / fname
@@ -340,20 +235,6 @@ def load_sinkignore():
         ignore_patterns[:] = patterns
     print(f"[sink] Loaded {len(ignore_patterns)} ignore patterns from {SINKIGNORE_PATH}")
     resync_unignored_files()
-
-def stable_wait(filepath, timeout=3):
-    start = time.time()
-    last = -1
-    while time.time() - start < timeout:
-        try:
-            size = os.path.getsize(filepath)
-        except Exception:
-            return False
-        if size == last:
-            return True
-        last = size
-        time.sleep(0.2)
-    return False
 
 class SinkIgnoreWatcher(FileSystemEventHandler):
     def __init__(self, watched_path):
@@ -392,6 +273,7 @@ def start_sinkignore_watcher():
 class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         device_id = self.headers.get("X-Sink-Device-ID")
+        remote_device_name = self.headers.get("X-Sink-Device-Name", "remote_device")
         if self.path == "/trust-notify":
             length = int(self.headers.get("Content-Length", 0))
             content = self.rfile.read(length)
@@ -412,24 +294,6 @@ class SinkHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.end_headers()
             except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-            return
-
-        if self.path == "/priority":
-            length = int(self.headers.get("Content-Length", 0))
-            content = self.rfile.read(length)
-            try:
-                data = json.loads(content)
-                remote_priority_id = data.get("priority_device_id")
-                remote_priority_name = data.get("priority_device_name")
-                save_priority(remote_priority_id, remote_priority_name)
-                load_priority()
-                print(f"[sink] Priority updated via peer: {remote_priority_id} ({remote_priority_name})")
-                self.send_response(200)
-                self.end_headers()
-            except Exception as e:
-                print(f"[sink] Failed to process /priority: {e}")
                 self.send_response(400)
                 self.end_headers()
             return
@@ -462,9 +326,6 @@ class SinkHandler(BaseHTTPRequestHandler):
                 filehash = meta["hash"]
                 if is_tempfile(rel_path) or is_ignored(rel_path):
                     response = {"status": "ignored"}
-                elif not ready_for_sync:
-                    response = {"status": "notready", "reason": "Priority is not set up"}
-                    self.log_message(f"Sync ignored for {rel_path} because priority not ready")
                 else:
                     dest = abs_path(rel_path)
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -472,11 +333,18 @@ class SinkHandler(BaseHTTPRequestHandler):
                     with open(tmp, "wb") as f:
                         f.write(content)
                     if dest.exists() and files_conflict(dest, tmp):
-                        resolve_conflict(rel_path, dest, tmp)
-                        if priority_device_id != DEVICE_ID:
-                            hash_cache[rel_path] = filehash
-                        response = {"status": "ok"}
-                        self.log_message(f"Conflict handled with priority for {rel_path}")
+                        loop_suppress.add(rel_path)
+                        handle_conflict(
+                            rel_path, dest, tmp,
+                            remote_device_name=remote_device_name,
+                            sync_callback=sync_to_peers,
+                            sync_folder=str(SYNC_FOLDER)
+                        )
+                        if dest.exists():
+                            dest.unlink()
+                        hash_cache.pop(rel_path, None)
+                        response = {"status": "conflict"}
+                        self.log_message(f"Conflict handled: both versions moved to .sink_conflicts")
                     else:
                         shutil.move(tmp, dest)
                         hash_cache[rel_path] = filehash
@@ -488,9 +356,6 @@ class SinkHandler(BaseHTTPRequestHandler):
                 rel_path = meta["rel_path"]
                 if is_tempfile(rel_path) or is_ignored(rel_path):
                     response = {"status": "ignored"}
-                elif not ready_for_sync:
-                    response = {"status": "notready", "reason": "Priority is not set up"}
-                    self.log_message(f"Delete ignored for {rel_path} because priority not ready")
                 else:
                     dest = abs_path(rel_path)
                     if dest.exists():
@@ -503,9 +368,6 @@ class SinkHandler(BaseHTTPRequestHandler):
                 new = meta["new"]
                 if is_tempfile(old) or is_tempfile(new) or is_ignored(old) or is_ignored(new):
                     response = {"status": "ignored"}
-                elif not ready_for_sync:
-                    response = {"status": "notready", "reason": "Priority is not set up"}
-                    self.log_message(f"Rename ignored for {old} -> {new} because priority not ready")
                 else:
                     src = abs_path(old)
                     dst = abs_path(new)
@@ -533,17 +395,6 @@ class SinkHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(response).encode())
-        elif self.path == "/priority":
-            if PRIORITY_FILE.exists():
-                with open(PRIORITY_FILE, "r") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(data.encode())
-            else:
-                self.send_response(404)
-                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
@@ -564,9 +415,6 @@ def get_peer_device_id(ip):
     return "", ip
 
 def initial_sync_to_peer(peer_ip, peer_id, peer_name):
-    if not ready_for_sync:
-        print("[sink] Not ready for sync, skipping initial sync.")
-        return
     print(f"[sink] Attempting initial sync to {peer_ip} ...")
     synced_any = False
     any_candidate = False
@@ -584,6 +432,7 @@ def initial_sync_to_peer(peer_ip, peer_id, peer_name):
                 headers = {
                     "X-Sink-Meta": json.dumps({"rel_path": rel, "hash": h}),
                     "X-Sink-Device-ID": DEVICE_ID,
+                    "X-Sink-Device-Name": socket.gethostname()
                 }
                 r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
                 if r.status_code == 202:
@@ -677,8 +526,6 @@ def start_discovery(trusted_only=False, prompt_on_new=True):
 
 class SinkEventHandler(FileSystemEventHandler):
     def on_modified(self, event):
-        if not ready_for_sync:
-            return
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
@@ -697,8 +544,6 @@ class SinkEventHandler(FileSystemEventHandler):
         sync_to_peers(rel, event.src_path, h)
 
     def on_created(self, event):
-        if not ready_for_sync:
-            return
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
@@ -707,8 +552,6 @@ class SinkEventHandler(FileSystemEventHandler):
         self.on_modified(event)
 
     def on_deleted(self, event):
-        if not ready_for_sync:
-            return
         if event.is_directory or is_tempfile(event.src_path):
             return
         rel = relative(event.src_path)
@@ -721,8 +564,6 @@ class SinkEventHandler(FileSystemEventHandler):
         delete_on_peers(rel)
 
     def on_moved(self, event):
-        if not ready_for_sync:
-            return
         if event.is_directory or is_tempfile(event.dest_path) or is_tempfile(event.src_path):
             return
         src_rel = relative(event.src_path)
@@ -766,9 +607,11 @@ if __name__ == "__main__":
     ignore_observer = start_sinkignore_watcher()
     zc = start_discovery(trusted_only=args.trusted_only, prompt_on_new=not args.no_prompt)
     print("[sink] Waiting for peers (start a second instance)...")
-
-    setup_phase_priority()
-    ready_for_sync = True
+    for _ in range(60):
+        with peer_lock:
+            if known_peers:
+                break
+        time.sleep(1)
 
     folder_observer = start_watcher()
 
@@ -781,4 +624,3 @@ if __name__ == "__main__":
     folder_observer.join()
     ignore_observer.join()
     zc.close()
-    wipe_priority()
