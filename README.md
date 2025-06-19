@@ -5,5 +5,5 @@ todo:
 - ~~.sinkignore (haha get it because gitignore sinkignore laughing so hard rn)~~
 - ui (make it electron not pyqt you cheap shit)
 - delta sync
-- multiple peers not just 2 (meshing it)
+- ~~multiple peers not just 2 (meshing it)~~ fuck this, daisy chaining works
 - system tray shenanigans 
