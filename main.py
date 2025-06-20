@@ -243,6 +243,15 @@ def rename_on_peers(old, new):
         except Exception as e:
             print(f"[sink] Rename failed to {peer_ip}: {e}")
 
+def try_remove_empty_parents(rel_path):
+    parent = abs_path(rel_path).parent
+    while parent != SYNC_FOLDER and parent.exists():
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
 def stable_wait(filepath, timeout=3):
     start = time.time()
     last = -1
@@ -450,6 +459,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                     dest = abs_path(rel_path)
                     if dest.exists():
                         dest.unlink()
+                        try_remove_empty_parents(rel_path)
                     response = {"status": "deleted"}
                     self.log_message(f"Deleted {rel_path}")
                     loop_suppress[rel_path] = time.time()
@@ -493,6 +503,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                     try:
                         if dest.exists() and dest.is_dir():
                             os.rmdir(dest)
+                            try_remove_empty_parents(rel_path)
                             loop_suppress[rel_path] = time.time()
                             response = {"status": "rmdir"}
                             self.log_message(f"Directory removed {rel_path}")
