@@ -168,8 +168,8 @@ def delete_on_peers(rel_path):
         except Exception as e:
             print(f"[sink] Delete failed to {peer_ip}: {e}")
 
-def mkdir_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+def mkdir_on_peers(rel_path, allow_conflict=False):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or (is_conflict_file(rel_path) and not allow_conflict):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -193,8 +193,8 @@ def mkdir_on_peers(rel_path):
         except Exception as e:
             print(f"[sink] Mkdir failed to {peer_ip}: {e}")
 
-def rmdir_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+def rmdir_on_peers(rel_path, allow_conflict=False):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or (is_conflict_file(rel_path) and not allow_conflict):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -392,7 +392,6 @@ class SinkHandler(BaseHTTPRequestHandler):
                 if is_tempfile(rel_path) or is_ignored(rel_path):
                     response = {"status": "ignored"}
                 elif is_conflict_file(rel_path):
-                    # If receiving a conflict file, always remove the original file at the conflicted path (if it exists)
                     parts = Path(rel_path).parts
                     if len(parts) >= 3:
                         orig_filename = parts[2].split('.', 1)[1] if '.' in parts[2] else parts[2]
@@ -474,7 +473,8 @@ class SinkHandler(BaseHTTPRequestHandler):
             elif self.path == "/mkdir":
                 meta = json.loads(content)
                 rel_path = meta["rel_path"]
-                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+                allow_conflict = is_conflict_file(rel_path)
+                if is_tempfile(rel_path) or is_ignored(rel_path) or (is_conflict_file(rel_path) and not allow_conflict):
                     response = {"status": "ignored"}
                 else:
                     dest = abs_path(rel_path)
@@ -485,7 +485,8 @@ class SinkHandler(BaseHTTPRequestHandler):
             elif self.path == "/rmdir":
                 meta = json.loads(content)
                 rel_path = meta["rel_path"]
-                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+                allow_conflict = is_conflict_file(rel_path)
+                if is_tempfile(rel_path) or is_ignored(rel_path) or (is_conflict_file(rel_path) and not allow_conflict):
                     response = {"status": "ignored"}
                 else:
                     dest = abs_path(rel_path)
@@ -538,20 +539,21 @@ def initial_sync_to_peer(peer_ip, peer_id, peer_name):
     print(f"[sink] Attempting initial sync to {peer_ip} ...")
     synced_any = False
     any_candidate = False
-    # Ensure directory structure exists before files
     dirs_created = set()
     for root, dirs, files in os.walk(SYNC_FOLDER):
         for d in dirs:
             absdir = Path(root) / d
             rel = relative(absdir)
-            if is_tempfile(rel) or is_ignored(rel) or is_conflict_file(rel):
+            allow_conflict = is_conflict_file(rel)
+            if is_tempfile(rel) or is_ignored(rel) or (is_conflict_file(rel) and not allow_conflict):
                 continue
-            mkdir_on_peers(rel)
+            mkdir_on_peers(rel, allow_conflict=allow_conflict)
             dirs_created.add(rel)
         for fname in files:
             absfile = Path(root) / fname
             rel = relative(absfile)
-            if is_tempfile(rel) or is_ignored(rel) or is_conflict_file(rel):
+            allow_conflict = is_conflict_file(rel)
+            if is_tempfile(rel) or is_ignored(rel) or (is_conflict_file(rel) and not allow_conflict):
                 continue
             any_candidate = True
             try:
@@ -604,7 +606,6 @@ class PeerListener:
                 print(f"[sink] Could not get device ID from {ip}, skipping.")
                 return
             if peer_id == DEVICE_ID:
-                # Ignore service from myself!
                 return
             trusted = is_device_trusted(peer_id)
             if self.trusted_only and not trusted:
@@ -675,32 +676,32 @@ class SinkEventHandler(FileSystemEventHandler):
         sync_to_peers(rel, event.src_path, h)
 
     def on_created(self, event):
+        rel = relative(event.src_path)
+        allow_conflict = is_conflict_file(rel)
         if event.is_directory:
-            rel = relative(event.src_path)
-            if is_ignored(rel) or is_conflict_file(rel):
+            if is_ignored(rel) or (is_conflict_file(rel) and not allow_conflict):
                 return
             if should_suppress(rel):
                 return
-            mkdir_on_peers(rel)
+            mkdir_on_peers(rel, allow_conflict=allow_conflict)
         else:
-            rel = relative(event.src_path)
-            if is_ignored(rel) or is_conflict_file(rel):
+            if is_ignored(rel) or (is_conflict_file(rel) and not allow_conflict):
                 return
             if should_suppress(rel):
                 return
             self.on_modified(event)
 
     def on_deleted(self, event):
+        rel = relative(event.src_path)
+        allow_conflict = is_conflict_file(rel)
         if event.is_directory:
-            rel = relative(event.src_path)
-            if is_ignored(rel) or is_conflict_file(rel):
+            if is_ignored(rel) or (is_conflict_file(rel) and not allow_conflict):
                 return
             if should_suppress(rel):
                 return
-            rmdir_on_peers(rel)
+            rmdir_on_peers(rel, allow_conflict=allow_conflict)
         else:
-            rel = relative(event.src_path)
-            if is_ignored(rel) or is_conflict_file(rel):
+            if is_ignored(rel) or (is_conflict_file(rel) and not allow_conflict):
                 return
             if should_suppress(rel):
                 return
@@ -708,16 +709,18 @@ class SinkEventHandler(FileSystemEventHandler):
             delete_on_peers(rel)
 
     def on_moved(self, event):
-        if event.is_directory or is_tempfile(event.dest_path) or is_tempfile(event.src_path):
-            return
         src_rel = relative(event.src_path)
         dst_rel = relative(event.dest_path)
-        if (is_ignored(src_rel) and is_ignored(dst_rel)) or (is_conflict_file(src_rel) and is_conflict_file(dst_rel)):
+        allow_conflict_src = is_conflict_file(src_rel)
+        allow_conflict_dst = is_conflict_file(dst_rel)
+        if event.is_directory or is_tempfile(event.dest_path) or is_tempfile(event.src_path):
+            return
+        if (is_ignored(src_rel) and is_ignored(dst_rel)) or ((is_conflict_file(src_rel) and not allow_conflict_src) and (is_conflict_file(dst_rel) and not allow_conflict_dst)):
             return
         if should_suppress(dst_rel):
             return
         hash_cache.pop(src_rel, None)
-        if not is_ignored(dst_rel) and not is_conflict_file(dst_rel):
+        if not is_ignored(dst_rel) and not (is_conflict_file(dst_rel) and not allow_conflict_dst):
             hash_cache[dst_rel] = hash_file(event.dest_path) if os.path.isfile(event.dest_path) else None
         rename_on_peers(src_rel, dst_rel)
 
