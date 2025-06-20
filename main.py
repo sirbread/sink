@@ -113,8 +113,8 @@ def try_initial_sync(peer_id):
         if peer_ip:
             threading.Thread(target=initial_sync_to_peer, args=(peer_ip, peer_id, peer_name), daemon=True).start()
 
-def sync_to_peers(rel_path, abs_path, filehash):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+def sync_to_peers(rel_path, abs_path, filehash, allow_conflict=False):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or (is_conflict_file(rel_path) and not allow_conflict):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -168,6 +168,56 @@ def delete_on_peers(rel_path):
         except Exception as e:
             print(f"[sink] Delete failed to {peer_ip}: {e}")
 
+def mkdir_on_peers(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+        return
+    with peer_lock:
+        peers = list(known_peers.values())
+    for peer in peers:
+        peer_ip = peer["ip"]
+        try:
+            data = json.dumps({"rel_path": rel_path})
+            headers = {"X-Sink-Device-ID": DEVICE_ID}
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/mkdir", headers=headers, data=data, timeout=5)
+            if r.status_code == 202:
+                update_peer_status(peer_ip, "pending")
+                print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
+            elif r.ok:
+                update_peer_status(peer_ip, "accepted")
+                print(f"[sink] Directory create sent for {rel_path} to {peer_ip}")
+            elif r.status_code == 403:
+                update_peer_status(peer_ip, "rejected")
+                print(f"[sink] Peer {peer_ip} rejected mkdir (not trusted by peer).")
+            else:
+                print(f"[sink] Mkdir failed to {peer_ip} (status: {r.status_code})")
+        except Exception as e:
+            print(f"[sink] Mkdir failed to {peer_ip}: {e}")
+
+def rmdir_on_peers(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+        return
+    with peer_lock:
+        peers = list(known_peers.values())
+    for peer in peers:
+        peer_ip = peer["ip"]
+        try:
+            data = json.dumps({"rel_path": rel_path})
+            headers = {"X-Sink-Device-ID": DEVICE_ID}
+            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/rmdir", headers=headers, data=data, timeout=5)
+            if r.status_code == 202:
+                update_peer_status(peer_ip, "pending")
+                print(f"[sink] You must authorize on the other device for sink! ({peer_ip})")
+            elif r.ok:
+                update_peer_status(peer_ip, "accepted")
+                print(f"[sink] Directory delete sent for {rel_path} to {peer_ip}")
+            elif r.status_code == 403:
+                update_peer_status(peer_ip, "rejected")
+                print(f"[sink] Peer {peer_ip} rejected rmdir (not trusted by peer).")
+            else:
+                print(f"[sink] Rmdir failed to {peer_ip} (status: {r.status_code})")
+        except Exception as e:
+            print(f"[sink] Rmdir failed to {peer_ip}: {e}")
+
 def rename_on_peers(old, new):
     if is_tempfile(old) or is_tempfile(new) or (is_ignored(old) and is_ignored(new)) or is_conflict_file(old) or is_conflict_file(new):
         return
@@ -210,10 +260,21 @@ def stable_wait(filepath, timeout=3):
 known_peers = {}
 peer_lock = threading.Lock()
 hash_cache = {}
-loop_suppress = set()
+loop_suppress = {}  # rel_path -> timestamp
+
+def should_suppress(rel):
+    t = loop_suppress.get(rel)
+    return t is not None and (time.time() - t < 5)
 
 def resync_unignored_files():
     for root, dirs, files in os.walk(SYNC_FOLDER):
+        for d in dirs:
+            absdir = Path(root) / d
+            rel = relative(absdir)
+            if is_tempfile(rel):
+                continue
+            if not is_ignored(rel) and not is_conflict_file(rel):
+                mkdir_on_peers(rel)
         for fname in files:
             absfile = Path(root) / fname
             rel = relative(absfile)
@@ -328,8 +389,25 @@ class SinkHandler(BaseHTTPRequestHandler):
                 meta = json.loads(self.headers.get("X-Sink-Meta", "{}"))
                 rel_path = meta["rel_path"]
                 filehash = meta["hash"]
-                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+                if is_tempfile(rel_path) or is_ignored(rel_path):
                     response = {"status": "ignored"}
+                elif is_conflict_file(rel_path):
+                    # If receiving a conflict file, always remove the original file at the conflicted path (if it exists)
+                    parts = Path(rel_path).parts
+                    if len(parts) >= 3:
+                        orig_filename = parts[2].split('.', 1)[1] if '.' in parts[2] else parts[2]
+                        orig_path = abs_path(orig_filename)
+                        if orig_path.exists():
+                            orig_path.unlink()
+                    dest = abs_path(rel_path)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.parent / (dest.name + ".sinktmp")
+                    with open(tmp, "wb") as f:
+                        f.write(content)
+                    shutil.move(tmp, dest)
+                    loop_suppress[rel_path] = time.time()
+                    response = {"status": "ok"}
+                    self.log_message(f"Received conflict file {rel_path}")
                 else:
                     dest = abs_path(rel_path)
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -340,12 +418,12 @@ class SinkHandler(BaseHTTPRequestHandler):
                     leader = min(my_name, remote_device_name)
                     if dest.exists() and files_conflict(dest, tmp):
                         if my_name == leader:
-                            loop_suppress.add(rel_path)
                             handle_conflict(
                                 rel_path, dest, tmp,
                                 remote_device_name=remote_device_name,
                                 sync_callback=sync_to_peers,
-                                sync_folder=str(SYNC_FOLDER)
+                                sync_folder=str(SYNC_FOLDER),
+                                loop_suppress=loop_suppress
                             )
                             if dest.exists():
                                 dest.unlink()
@@ -357,10 +435,11 @@ class SinkHandler(BaseHTTPRequestHandler):
                                 tmp.unlink()
                             response = {"status": "conflict-ignored"}
                             self.log_message(f"Conflict detected but not handled (not leader)")
+                        loop_suppress[rel_path] = time.time()
                     else:
                         shutil.move(tmp, dest)
                         hash_cache[rel_path] = filehash
-                        loop_suppress.add(rel_path)
+                        loop_suppress[rel_path] = time.time()
                         response = {"status": "ok"}
                         self.log_message(f"Received {rel_path}")
             elif self.path == "/delete":
@@ -374,6 +453,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                         dest.unlink()
                     response = {"status": "deleted"}
                     self.log_message(f"Deleted {rel_path}")
+                    loop_suppress[rel_path] = time.time()
             elif self.path == "/rename":
                 meta = json.loads(content)
                 old = meta["old"]
@@ -386,11 +466,39 @@ class SinkHandler(BaseHTTPRequestHandler):
                     if src.exists():
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         src.rename(dst)
-                        loop_suppress.add(new)
+                        loop_suppress[new] = time.time()
                         response = {"status": "renamed"}
                         self.log_message(f"Renamed {old} to {new}")
                     else:
                         response = {"status": "notfound"}
+            elif self.path == "/mkdir":
+                meta = json.loads(content)
+                rel_path = meta["rel_path"]
+                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+                    response = {"status": "ignored"}
+                else:
+                    dest = abs_path(rel_path)
+                    dest.mkdir(parents=True, exist_ok=True)
+                    loop_suppress[rel_path] = time.time()
+                    response = {"status": "mkdir"}
+                    self.log_message(f"Directory created {rel_path}")
+            elif self.path == "/rmdir":
+                meta = json.loads(content)
+                rel_path = meta["rel_path"]
+                if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+                    response = {"status": "ignored"}
+                else:
+                    dest = abs_path(rel_path)
+                    try:
+                        if dest.exists() and dest.is_dir():
+                            os.rmdir(dest)
+                            loop_suppress[rel_path] = time.time()
+                            response = {"status": "rmdir"}
+                            self.log_message(f"Directory removed {rel_path}")
+                        else:
+                            response = {"status": "notfound"}
+                    except Exception as e:
+                        response = {"status": "error", "message": str(e)}
             else:
                 response = {"status": "badpath"}
         except Exception as e:
@@ -430,7 +538,16 @@ def initial_sync_to_peer(peer_ip, peer_id, peer_name):
     print(f"[sink] Attempting initial sync to {peer_ip} ...")
     synced_any = False
     any_candidate = False
+    # Ensure directory structure exists before files
+    dirs_created = set()
     for root, dirs, files in os.walk(SYNC_FOLDER):
+        for d in dirs:
+            absdir = Path(root) / d
+            rel = relative(absdir)
+            if is_tempfile(rel) or is_ignored(rel) or is_conflict_file(rel):
+                continue
+            mkdir_on_peers(rel)
+            dirs_created.add(rel)
         for fname in files:
             absfile = Path(root) / fname
             rel = relative(absfile)
@@ -485,6 +602,9 @@ class PeerListener:
             peer_id, peer_name = get_peer_device_id(ip)
             if not peer_id:
                 print(f"[sink] Could not get device ID from {ip}, skipping.")
+                return
+            if peer_id == DEVICE_ID:
+                # Ignore service from myself!
                 return
             trusted = is_device_trusted(peer_id)
             if self.trusted_only and not trusted:
@@ -543,8 +663,7 @@ class SinkEventHandler(FileSystemEventHandler):
         rel = relative(event.src_path)
         if is_ignored(rel) or is_conflict_file(rel):
             return
-        if rel in loop_suppress:
-            loop_suppress.discard(rel)
+        if should_suppress(rel):
             return
         if not stable_wait(event.src_path):
             print(f"[sink] Skipped unstable {rel}")
@@ -556,24 +675,37 @@ class SinkEventHandler(FileSystemEventHandler):
         sync_to_peers(rel, event.src_path, h)
 
     def on_created(self, event):
-        if event.is_directory or is_tempfile(event.src_path):
-            return
-        rel = relative(event.src_path)
-        if is_ignored(rel) or is_conflict_file(rel):
-            return
-        self.on_modified(event)
+        if event.is_directory:
+            rel = relative(event.src_path)
+            if is_ignored(rel) or is_conflict_file(rel):
+                return
+            if should_suppress(rel):
+                return
+            mkdir_on_peers(rel)
+        else:
+            rel = relative(event.src_path)
+            if is_ignored(rel) or is_conflict_file(rel):
+                return
+            if should_suppress(rel):
+                return
+            self.on_modified(event)
 
     def on_deleted(self, event):
-        if event.is_directory or is_tempfile(event.src_path):
-            return
-        rel = relative(event.src_path)
-        if is_ignored(rel) or is_conflict_file(rel):
-            return
-        if rel in loop_suppress:
-            loop_suppress.discard(rel)
-            return
-        hash_cache.pop(rel, None)
-        delete_on_peers(rel)
+        if event.is_directory:
+            rel = relative(event.src_path)
+            if is_ignored(rel) or is_conflict_file(rel):
+                return
+            if should_suppress(rel):
+                return
+            rmdir_on_peers(rel)
+        else:
+            rel = relative(event.src_path)
+            if is_ignored(rel) or is_conflict_file(rel):
+                return
+            if should_suppress(rel):
+                return
+            hash_cache.pop(rel, None)
+            delete_on_peers(rel)
 
     def on_moved(self, event):
         if event.is_directory or is_tempfile(event.dest_path) or is_tempfile(event.src_path):
@@ -581,6 +713,8 @@ class SinkEventHandler(FileSystemEventHandler):
         src_rel = relative(event.src_path)
         dst_rel = relative(event.dest_path)
         if (is_ignored(src_rel) and is_ignored(dst_rel)) or (is_conflict_file(src_rel) and is_conflict_file(dst_rel)):
+            return
+        if should_suppress(dst_rel):
             return
         hash_cache.pop(src_rel, None)
         if not is_ignored(dst_rel) and not is_conflict_file(dst_rel):

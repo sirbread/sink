@@ -25,7 +25,7 @@ def files_conflict(local_path, incoming_temp_path):
 def get_device_name():
     return socket.gethostname()
 
-def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name, sync_callback=None, sync_folder=None):
+def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name, sync_callback=None, sync_folder=None, loop_suppress=None):
     device_name = get_device_name()
     conflict_base = Path(local_path).parent / ".sink_conflicts"
     local_conflict_dir = conflict_base / device_name
@@ -45,13 +45,17 @@ def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name
         print(f"[sink] Local conflicting file moved to {local_conflict_file}")
         if sync_callback and sync_folder:
             rel_conflict = os.path.relpath(local_conflict_file, start=sync_folder)
-            sync_callback(rel_conflict, str(local_conflict_file), file_hash(local_conflict_file))
+            if loop_suppress is not None:
+                loop_suppress[rel_conflict] = time.time()
+            sync_callback(rel_conflict, str(local_conflict_file), file_hash(local_conflict_file), allow_conflict=True)
 
     if Path(incoming_temp_path).exists():
         shutil.move(str(incoming_temp_path), str(remote_conflict_file))
         print(f"[sink] Incoming conflicting file moved to {remote_conflict_file}")
         if sync_callback and sync_folder:
             rel_conflict = os.path.relpath(remote_conflict_file, start=sync_folder)
-            sync_callback(rel_conflict, str(remote_conflict_file), file_hash(remote_conflict_file))
+            if loop_suppress is not None:
+                loop_suppress[rel_conflict] = time.time()
+            sync_callback(rel_conflict, str(remote_conflict_file), file_hash(remote_conflict_file), allow_conflict=True)
 
     print(f"[sink] Conflict detected for {rel_path}. Both versions moved to .sink_conflicts/{device_name}/ and .sink_conflicts/{remote_device_name}/")
