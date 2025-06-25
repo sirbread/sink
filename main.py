@@ -1,5 +1,3 @@
-#sink non event driven
-#because we love edge cases don't we
 import os
 import sys
 import time
@@ -85,6 +83,22 @@ def load_sinkignore():
     with ignore_lock:
         ignore_patterns[:] = patterns
     print(f"[sink] Loaded {len(ignore_patterns)} ignore patterns from {SINKIGNORE_PATH}")
+
+def watch_sinkignore():
+    last_mtime = SINKIGNORE_PATH.stat().st_mtime if SINKIGNORE_PATH.exists() else 0
+    while True:
+        try:
+            current_mtime = SINKIGNORE_PATH.stat().st_mtime
+            if current_mtime != last_mtime:
+                print("[sink] Reloading .sinkignore...")
+                load_sinkignore()
+                last_mtime = current_mtime
+        except FileNotFoundError:
+            if last_mtime != 0:
+                print("[sink] .sinkignore deleted, clearing patterns...")
+                load_sinkignore()
+                last_mtime = 0
+        time.sleep(2)
 
 def hash_file(filepath):
     try:
@@ -179,15 +193,11 @@ def sync_to_peers(rel_path, abs_path, filehash):
                 "X-Sink-Device-ID": DEVICE_ID,
                 "X-Sink-Device-Name": get_hostname()
             }
-            r = requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
-            if r.ok:
-                print(f"[sink] Synced {rel_path} to {peer_ip}")
-        except Exception as e:
-            print(f"[sink] Sync failed to {peer_ip}: {e}")
+            requests.post(f"http://{peer_ip}:{PEER_PORT}/sync", headers=headers, data=data, timeout=5)
+        except Exception:
+            pass
 
 def delete_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
-        return
     with peer_lock:
         peers = list(known_peers.values())
     for peer in peers:
@@ -196,12 +206,10 @@ def delete_on_peers(rel_path):
             data = json.dumps({"rel_path": rel_path})
             headers = {"X-Sink-Device-ID": DEVICE_ID}
             requests.post(f"http://{peer_ip}:{PEER_PORT}/delete", headers=headers, data=data, timeout=5)
-        except Exception as e:
-            print(f"[sink] Delete failed to {peer_ip}: {e}")
+        except Exception:
+            pass
 
 def mkdir_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
-        return
     with peer_lock:
         peers = list(known_peers.values())
     for peer in peers:
@@ -210,12 +218,10 @@ def mkdir_on_peers(rel_path):
             data = json.dumps({"rel_path": rel_path})
             headers = {"X-Sink-Device-ID": DEVICE_ID}
             requests.post(f"http://{peer_ip}:{PEER_PORT}/mkdir", headers=headers, data=data, timeout=5)
-        except Exception as e:
-            print(f"[sink] Mkdir failed to {peer_ip}: {e}")
+        except Exception:
+            pass
 
 def rmdir_on_peers(rel_path):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
-        return
     with peer_lock:
         peers = list(known_peers.values())
     for peer in peers:
@@ -224,14 +230,13 @@ def rmdir_on_peers(rel_path):
             data = json.dumps({"rel_path": rel_path})
             headers = {"X-Sink-Device-ID": DEVICE_ID}
             requests.post(f"http://{peer_ip}:{PEER_PORT}/rmdir", headers=headers, data=data, timeout=5)
-        except Exception as e:
-            print(f"[sink] Rmdir failed to {peer_ip}: {e}")
+        except Exception:
+            pass
 
 class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         device_id = self.headers.get("X-Sink-Device-ID")
         remote_device_name = self.headers.get("X-Sink-Device-Name", "remote_device")
-
         if not device_id or not is_device_trusted(device_id):
             self.send_response(202)
             self.end_headers()
@@ -249,14 +254,11 @@ class SinkHandler(BaseHTTPRequestHandler):
             tmp = dest.with_suffix(dest.suffix + ".sinktmp")
             with open(tmp, "wb") as f:
                 f.write(content)
-
             if dest.exists() and files_conflict(dest, tmp):
                 handle_conflict(rel_path, dest, tmp, remote_device_name)
-                self.send_response(200)
-                self.end_headers()
-                return
-            shutil.move(tmp, dest)
-            hash_cache[rel_path] = filehash
+            else:
+                shutil.move(tmp, dest)
+                hash_cache[rel_path] = filehash
             self.send_response(200)
             self.end_headers()
 
@@ -275,17 +277,15 @@ class SinkHandler(BaseHTTPRequestHandler):
         elif self.path == "/mkdir":
             meta = json.loads(content)
             rel_path = meta["rel_path"]
-            path = abs_path(rel_path)
-            path.mkdir(parents=True, exist_ok=True)
+            abs_path(rel_path).mkdir(parents=True, exist_ok=True)
             self.send_response(200)
             self.end_headers()
 
         elif self.path == "/rmdir":
             meta = json.loads(content)
             rel_path = meta["rel_path"]
-            path = abs_path(rel_path)
             try:
-                path.rmdir()
+                abs_path(rel_path).rmdir()
             except:
                 pass
             self.send_response(200)
@@ -293,18 +293,18 @@ class SinkHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/device_id":
-            resp = {"device_id": DEVICE_ID, "device_name": get_hostname()}
+            data = {"device_id": DEVICE_ID, "device_name": get_hostname()}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(resp).encode())
+            self.wfile.write(json.dumps(data).encode())
         else:
             self.send_response(404)
             self.end_headers()
 
 def run_http_server():
     server = HTTPServer(("0.0.0.0", PEER_PORT), SinkHandler)
-    print(f"[sink] HTTP server listening on port {PEER_PORT}")
+    print(f"[sink] Listening on port {PEER_PORT}")
     server.serve_forever()
 
 class PeerListener:
@@ -333,10 +333,10 @@ class PeerListener:
             except:
                 pass
 
-    def remove_service(self, zc, type_, name):
+    def remove_service(self, *args):
         pass
 
-    def update_service(self, zc, type_, name):
+    def update_service(self, *args):
         pass
 
 def start_discovery():
@@ -350,10 +350,8 @@ def start_discovery():
         server=f"{get_hostname()}.local."
     )
     zeroconf.register_service(info)
-    listener = PeerListener(get_local_ip())
-    ServiceBrowser(zeroconf, SERVICE_TYPE, listener)
+    ServiceBrowser(zeroconf, SERVICE_TYPE, PeerListener(get_local_ip()))
     print("[sink] Zeroconf discovery started")
-    return zeroconf
 
 def snapshot_folder():
     snap = {}
@@ -411,13 +409,23 @@ def poll_and_sync():
 if __name__ == "__main__":
     load_sinkignore()
     print(f"[sink] Syncing folder: {SYNC_FOLDER}")
+
+    snapshot = snapshot_folder()
+    for path, (typ, val) in snapshot.items():
+        if typ == "dir":
+            mkdir_on_peers(path)
+        elif typ == "file":
+            absf = abs_path(path)
+            hash_cache[path] = val
+            sync_to_peers(path, absf, val)
+
     threading.Thread(target=run_http_server, daemon=True).start()
     start_discovery()
     threading.Thread(target=poll_and_sync, daemon=True).start()
+    threading.Thread(target=watch_sinkignore, daemon=True).start()
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("[sink] Shutting down.")
-
+        print("[sink] Exiting.")
