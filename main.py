@@ -330,6 +330,14 @@ class PeerListener:
                     with peer_lock:
                         known_peers[peer_id] = {"ip": ip, "device_id": peer_id, "name": peer_name}
                     print(f"[sink] Found peer {peer_id} ({ip})")
+                    snapshot = snapshot_folder()
+                    for path, (typ, val) in snapshot.items():
+                        if typ == "dir":
+                            mkdir_on_peers(path)
+                        elif typ == "file":
+                            absf = abs_path(path)
+                            hash_cache[path] = val
+                            sync_to_peers(path, absf, val)
             except:
                 pass
 
@@ -416,7 +424,6 @@ if __name__ == "__main__":
             mkdir_on_peers(path)
         elif typ == "file":
             absf = abs_path(path)
-            hash_cache[path] = val
             sync_to_peers(path, absf, val)
 
     threading.Thread(target=run_http_server, daemon=True).start()
