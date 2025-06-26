@@ -67,8 +67,7 @@ def is_ignored(rel_path):
     return False
 
 def is_conflict_file(rel_path):
-    parts = Path(rel_path).parts
-    return len(parts) > 0 and parts[0] == ".sink_conflicts"
+    return False
 
 def load_sinkignore():
     global ignore_patterns
@@ -179,7 +178,7 @@ def update_device_ip(device_id, ip):
         save_trusted_devices(devices)
 
 def sync_to_peers(rel_path, abs_path, filehash):
-    if is_tempfile(rel_path) or is_ignored(rel_path) or is_conflict_file(rel_path):
+    if is_tempfile(rel_path) or is_ignored(rel_path):
         return
     with peer_lock:
         peers = list(known_peers.values())
@@ -367,13 +366,13 @@ def snapshot_folder():
         for d in dirs:
             path = Path(root) / d
             rel = relative(path)
-            if is_ignored(rel) or is_tempfile(rel) or is_conflict_file(rel):
+            if is_ignored(rel) or is_tempfile(rel):
                 continue
             snap[rel] = ("dir", path.stat().st_mtime)
         for f in files:
             path = Path(root) / f
             rel = relative(path)
-            if is_ignored(rel) or is_tempfile(rel) or is_conflict_file(rel):
+            if is_ignored(rel) or is_tempfile(rel):
                 continue
             snap[rel] = ("file", hash_file(path))
     return snap
@@ -424,6 +423,7 @@ if __name__ == "__main__":
             mkdir_on_peers(path)
         elif typ == "file":
             absf = abs_path(path)
+            hash_cache[path] = val
             sync_to_peers(path, absf, val)
 
     threading.Thread(target=run_http_server, daemon=True).start()
