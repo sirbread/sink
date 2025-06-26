@@ -27,7 +27,8 @@ ignore_lock = threading.Lock()
 
 DEVICES_FILE = Path(__file__).parent / "devices.json"
 
-hash_cache = {}
+conflicted_paths = set()
+conflicted_paths_lock = threading.Lock()
 known_peers = {}
 peer_status = {}
 peer_lock = threading.Lock()
@@ -137,17 +138,16 @@ def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name
             shutil.move(str(local_path), str(local_conflict_file))
             print(f"[sink] Local conflicting file moved to {local_conflict_file}")
         else:
-            Path(local_path).unlink()
+            Path(local_path).unlink(missing_ok=True)
 
     if Path(incoming_temp_path).exists():
         if not remote_conflict_file.exists():
             shutil.move(str(incoming_temp_path), str(remote_conflict_file))
             print(f"[sink] Incoming conflicting file moved to {remote_conflict_file}")
         else:
-            Path(incoming_temp_path).unlink()
+            Path(incoming_temp_path).unlink(missing_ok=True)
 
     print(f"[sink] Conflict for {rel_path} handled. Versions stored in .sink_conflicts/")
-
 
 def load_trusted_devices():
     if not DEVICES_FILE.exists():
@@ -310,7 +310,6 @@ class SinkHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-
         length = int(self.headers.get("Content-Length", 0))
         content = self.rfile.read(length)
 
@@ -326,6 +325,8 @@ class SinkHandler(BaseHTTPRequestHandler):
             
             if dest.exists() and files_conflict(dest, tmp):
                 handle_conflict(rel_path, dest, tmp, remote_device_name)
+                with conflicted_paths_lock:
+                    conflicted_paths.add(rel_path)
             else:
                 shutil.move(tmp, dest)
 
@@ -446,10 +447,17 @@ def snapshot_folder():
     return snap
 
 def poll_and_sync():
-    previous = {}
+    previous = snapshot_folder()
     print("[sink] Polling every 1s")
     while True:
         current = snapshot_folder()
+        
+        with conflicted_paths_lock:
+            for path in list(conflicted_paths):
+                if path in previous:
+                    del previous[path]
+                conflicted_paths.remove(path)
+
         added = set(current) - set(previous)
         removed = set(previous) - set(current)
         common = set(current) & set(previous)
@@ -462,7 +470,6 @@ def poll_and_sync():
                 absf = abs_path(path)
                 sync_to_peers(path, absf, val)
 
-        #sort removed paths by length, descending, to delete files before their parent dirs
         for path in sorted(list(removed), key=len, reverse=True):
             typ, val = previous[path]
             if typ == "dir":
