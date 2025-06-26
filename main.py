@@ -317,7 +317,6 @@ class SinkHandler(BaseHTTPRequestHandler):
         if self.path == "/sync":
             meta = json.loads(self.headers.get("X-Sink-Meta", "{}"))
             rel_path = meta["rel_path"]
-            filehash = meta["hash"]
             dest = abs_path(rel_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_suffix(dest.suffix + ".sinktmp")
@@ -329,7 +328,6 @@ class SinkHandler(BaseHTTPRequestHandler):
                 handle_conflict(rel_path, dest, tmp, remote_device_name)
             else:
                 shutil.move(tmp, dest)
-                hash_cache[rel_path] = filehash
 
             self.send_response(200)
             self.end_headers()
@@ -338,12 +336,10 @@ class SinkHandler(BaseHTTPRequestHandler):
             meta = json.loads(content)
             rel_path = meta["rel_path"]
             path = abs_path(rel_path)
-            if path.exists():
-                if path.is_file():
-                    path.unlink()
-                else:
-                    shutil.rmtree(path, ignore_errors=True)
-                hash_cache.pop(rel_path, None)
+            if path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
             self.send_response(200)
             self.end_headers()
 
@@ -464,22 +460,20 @@ def poll_and_sync():
                 mkdir_on_peers(path)
             else:
                 absf = abs_path(path)
-                hash_cache[path] = val
                 sync_to_peers(path, absf, val)
 
-        for path in removed:
+        #sort removed paths by length, descending, to delete files before their parent dirs
+        for path in sorted(list(removed), key=len, reverse=True):
             typ, val = previous[path]
             if typ == "dir":
                 rmdir_on_peers(path)
             else:
                 delete_on_peers(path)
-                hash_cache.pop(path, None)
 
         for path in common:
             typ, val = current[path]
             if typ == "file" and val != previous.get(path, (None, None))[1]:
                 absf = abs_path(path)
-                hash_cache[path] = val
                 sync_to_peers(path, absf, val)
 
         previous = current
