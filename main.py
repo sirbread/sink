@@ -28,10 +28,8 @@ ignore_lock = threading.Lock()
 DEVICES_FILE = Path(__file__).parent / "devices.json"
 
 hash_cache = {}
-loop_suppress = {}
 known_peers = {}
 peer_status = {}
-trusted_by_devices = set()
 peer_lock = threading.Lock()
 
 def get_hostname():
@@ -64,9 +62,6 @@ def is_ignored(rel_path):
     for pat in patterns:
         if fnmatch.fnmatch(rel_path, pat):
             return True
-    return False
-
-def is_conflict_file(rel_path):
     return False
 
 def load_sinkignore():
@@ -109,15 +104,12 @@ def hash_file(filepath):
                     break
                 h.update(chunk)
         return h.hexdigest()
-    except Exception:
+    except (IOError, OSError):
         return None
 
-def file_hash(path):
-    return hash_file(path)
-
 def files_conflict(local_path, incoming_temp_path):
-    h1 = file_hash(local_path)
-    h2 = file_hash(incoming_temp_path)
+    h1 = hash_file(local_path)
+    h2 = hash_file(incoming_temp_path)
     return h1 is not None and h2 is not None and h1 != h2
 
 def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name):
@@ -129,21 +121,33 @@ def handle_conflict(rel_path, local_path, incoming_temp_path, remote_device_name
     local_conflict_dir.mkdir(parents=True, exist_ok=True)
     remote_conflict_dir.mkdir(parents=True, exist_ok=True)
 
-    rel_filename = Path(rel_path).name
-    timestamp = int(time.time())
+    local_hash = hash_file(local_path)
+    remote_hash = hash_file(incoming_temp_path)
 
-    local_conflict_file = local_conflict_dir / f"{timestamp}.{rel_filename}"
-    remote_conflict_file = remote_conflict_dir / f"{timestamp}.{rel_filename}"
+    if not local_hash or not remote_hash:
+        print(f"[sink] Could not hash conflicting files for {rel_path}, using timestamp fallback.")
+        local_hash = remote_hash = str(int(time.time()))
+    
+    rel_filename = Path(rel_path).name
+    local_conflict_file = local_conflict_dir / f"{local_hash[:8]}-{rel_filename}"
+    remote_conflict_file = remote_conflict_dir / f"{remote_hash[:8]}-{rel_filename}"
 
     if Path(local_path).exists():
-        shutil.move(str(local_path), str(local_conflict_file))
-        print(f"[sink] Local conflicting file moved to {local_conflict_file}")
+        if not local_conflict_file.exists():
+            shutil.move(str(local_path), str(local_conflict_file))
+            print(f"[sink] Local conflicting file moved to {local_conflict_file}")
+        else:
+            Path(local_path).unlink()
 
     if Path(incoming_temp_path).exists():
-        shutil.move(str(incoming_temp_path), str(remote_conflict_file))
-        print(f"[sink] Incoming conflicting file moved to {remote_conflict_file}")
+        if not remote_conflict_file.exists():
+            shutil.move(str(incoming_temp_path), str(remote_conflict_file))
+            print(f"[sink] Incoming conflicting file moved to {remote_conflict_file}")
+        else:
+            Path(incoming_temp_path).unlink()
 
-    print(f"[sink] Conflict for {rel_path}. Stored in .sink_conflicts/")
+    print(f"[sink] Conflict for {rel_path} handled. Versions stored in .sink_conflicts/")
+
 
 def load_trusted_devices():
     if not DEVICES_FILE.exists():
@@ -166,7 +170,7 @@ def is_device_trusted(device_id):
 def add_trusted_device(device_id, name, ip):
     devices = load_trusted_devices()
     if device_id not in devices:
-        print(f"[sink] Trusting new device: {device_id} ({name}) at {ip}")
+        print(f"[sink] Trusting new device: {name} ({device_id})")
     devices[device_id] = {"device_id": device_id, "name": name, "last_ip": ip}
     save_trusted_devices(devices)
     return True
@@ -176,6 +180,19 @@ def update_device_ip(device_id, ip):
     if device_id in devices:
         devices[device_id]["last_ip"] = ip
         save_trusted_devices(devices)
+
+def sync_folder_to_peer(peer):
+    peer_ip = peer['ip']
+    print(f"[sink] Performing initial sync with {peer['name']} ({peer_ip})")
+    snapshot = snapshot_folder()
+    for path, (typ, val) in snapshot.items():
+        if is_ignored(path) or is_tempfile(path):
+            continue
+        if typ == "dir":
+            mkdir_on_peers(path)
+        elif typ == "file":
+            absf = abs_path(path)
+            sync_to_peers(path, absf, val)
 
 def sync_to_peers(rel_path, abs_path, filehash):
     if is_tempfile(rel_path) or is_ignored(rel_path):
@@ -236,10 +253,63 @@ class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         device_id = self.headers.get("X-Sink-Device-ID")
         remote_device_name = self.headers.get("X-Sink-Device-Name", "remote_device")
-        if not device_id or not is_device_trusted(device_id):
-            self.send_response(202)
+
+        if self.path == "/auth":
+            if not device_id:
+                self.send_response(400, "Device ID header missing")
+                self.end_headers()
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length))
+            action = data.get('action')
+
+            with peer_lock:
+                if action == 'request_trust':
+                    peer_ip = self.client_address[0]
+                    if is_device_trusted(device_id):
+                        try:
+                            headers = {'X-Sink-Device-ID': DEVICE_ID, 'X-Sink-Device-Name': get_hostname()}
+                            requests.post(f"http://{peer_ip}:{PEER_PORT}/auth", headers=headers, json={'action': 'confirm_trust'}, timeout=5)
+                        except requests.exceptions.RequestException: pass
+                    elif device_id in peer_status:
+                        state = peer_status[device_id]['state']
+                        if state == 'requested': 
+                            print(f"\n[sink] Mutual trust with {remote_device_name} ({device_id}).")
+                            add_trusted_device(device_id, remote_device_name, peer_ip)
+                            newly_trusted_peer = peer_status.pop(device_id)
+                            known_peers[device_id] = newly_trusted_peer
+                            try:
+                                headers = {'X-Sink-Device-ID': DEVICE_ID, 'X-Sink-Device-Name': get_hostname()}
+                                requests.post(f"http://{peer_ip}:{PEER_PORT}/auth", headers=headers, json={'action': 'confirm_trust'}, timeout=5)
+                            except requests.exceptions.RequestException: pass
+                            threading.Thread(target=sync_folder_to_peer, args=(newly_trusted_peer,), daemon=True).start()
+                        else: 
+                            peer_status[device_id]['state'] = 'approved'
+                            print(f"\n[sink] {remote_device_name} ({device_id}) wants to sync.")
+                            print(f"[sink] To approve, type 'trust {device_id}'")
+                    else:
+                        peer_status[device_id] = {'name': remote_device_name, 'ip': peer_ip, 'state': 'approved'}
+                        print(f"\n[sink] {remote_device_name} ({device_id}) wants to sync.")
+                        print(f"[sink] To approve, type 'trust {device_id}'")
+
+                elif action == 'confirm_trust':
+                    if device_id in peer_status and peer_status[device_id]['state'] == 'requested':
+                        print(f"\n[sink] {remote_device_name} ({device_id}) confirmed trust.")
+                        add_trusted_device(device_id, remote_device_name, self.client_address[0])
+                        newly_trusted_peer = peer_status.pop(device_id)
+                        known_peers[device_id] = newly_trusted_peer
+                        threading.Thread(target=sync_folder_to_peer, args=(newly_trusted_peer,), daemon=True).start()
+
+            self.send_response(200)
             self.end_headers()
             return
+
+        if not device_id or not is_device_trusted(device_id):
+            self.send_response(403, "Device not trusted")
+            self.end_headers()
+            return
+
 
         length = int(self.headers.get("Content-Length", 0))
         content = self.rfile.read(length)
@@ -251,13 +321,16 @@ class SinkHandler(BaseHTTPRequestHandler):
             dest = abs_path(rel_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_suffix(dest.suffix + ".sinktmp")
+            
             with open(tmp, "wb") as f:
                 f.write(content)
+            
             if dest.exists() and files_conflict(dest, tmp):
                 handle_conflict(rel_path, dest, tmp, remote_device_name)
             else:
                 shutil.move(tmp, dest)
                 hash_cache[rel_path] = filehash
+
             self.send_response(200)
             self.end_headers()
 
@@ -270,6 +343,7 @@ class SinkHandler(BaseHTTPRequestHandler):
                     path.unlink()
                 else:
                     shutil.rmtree(path, ignore_errors=True)
+                hash_cache.pop(rel_path, None)
             self.send_response(200)
             self.end_headers()
 
@@ -285,9 +359,12 @@ class SinkHandler(BaseHTTPRequestHandler):
             rel_path = meta["rel_path"]
             try:
                 abs_path(rel_path).rmdir()
-            except:
+            except OSError:
                 pass
             self.send_response(200)
+            self.end_headers()
+        else:
+            self.send_response(404)
             self.end_headers()
 
     def do_GET(self):
@@ -314,37 +391,31 @@ class PeerListener:
         info = zc.get_service_info(type_, name)
         if info:
             ip = socket.inet_ntoa(info.addresses[0])
-            if ip == self.local_ip:
-                return
+            if ip == self.local_ip: return
             try:
                 r = requests.get(f"http://{ip}:{PEER_PORT}/device_id", timeout=2)
                 if r.ok:
                     data = r.json()
-                    peer_id = data["device_id"]
-                    peer_name = data["device_name"]
-                    if peer_id == DEVICE_ID:
-                        return
-                    add_trusted_device(peer_id, peer_name, ip)
-                    update_device_ip(peer_id, ip)
+                    peer_id, peer_name = data["device_id"], data["device_name"]
+                    if peer_id == DEVICE_ID: return
+                    
                     with peer_lock:
-                        known_peers[peer_id] = {"ip": ip, "device_id": peer_id, "name": peer_name}
-                    print(f"[sink] Found peer {peer_id} ({ip})")
-                    snapshot = snapshot_folder()
-                    for path, (typ, val) in snapshot.items():
-                        if typ == "dir":
-                            mkdir_on_peers(path)
-                        elif typ == "file":
-                            absf = abs_path(path)
-                            hash_cache[path] = val
-                            sync_to_peers(path, absf, val)
-            except:
+                        if is_device_trusted(peer_id):
+                            if peer_id not in known_peers:
+                                print(f"[sink] Found trusted peer {peer_name} ({ip})")
+                                update_device_ip(peer_id, ip)
+                                peer_info = {"ip": ip, "device_id": peer_id, "name": peer_name}
+                                known_peers[peer_id] = peer_info
+                                threading.Thread(target=sync_folder_to_peer, args=(peer_info,), daemon=True).start()
+                        elif peer_id not in peer_status:
+                            peer_status[peer_id] = {"name": peer_name, "ip": ip, "state": "pending"}
+                            print(f"\n[sink] Discovered new device: {peer_name} ({peer_id}).")
+                            print(f"[sink] To connect, type 'trust {peer_id}'")
+            except requests.exceptions.RequestException:
                 pass
 
-    def remove_service(self, *args):
-        pass
-
-    def update_service(self, *args):
-        pass
+    def remove_service(self, *args): pass
+    def update_service(self, *args): pass
 
 def start_discovery():
     zeroconf = Zeroconf()
@@ -363,10 +434,11 @@ def start_discovery():
 def snapshot_folder():
     snap = {}
     for root, dirs, files in os.walk(SYNC_FOLDER):
-        for d in dirs:
+        for d in list(dirs):
             path = Path(root) / d
             rel = relative(path)
             if is_ignored(rel) or is_tempfile(rel):
+                dirs.remove(d) 
                 continue
             snap[rel] = ("dir", path.stat().st_mtime)
         for f in files:
@@ -405,7 +477,7 @@ def poll_and_sync():
 
         for path in common:
             typ, val = current[path]
-            if typ == "file" and val != previous[path][1]:
+            if typ == "file" and val != previous.get(path, (None, None))[1]:
                 absf = abs_path(path)
                 hash_cache[path] = val
                 sync_to_peers(path, absf, val)
@@ -413,26 +485,100 @@ def poll_and_sync():
         previous = current
         time.sleep(1)
 
+def handle_user_input():
+    time.sleep(2) 
+    print("\n[sink] Ready. Type 'devices' to see discovered devices or 'trust <id>' to connect.")
+    while True:
+        try:
+            cmd = input("> ")
+            parts = cmd.strip().split()
+            if not parts: continue
+            
+            command = parts[0].lower()
+            if command == 'trust' and len(parts) > 1:
+                peer_id = parts[1]
+                with peer_lock:
+                    if is_device_trusted(peer_id):
+                        print(f"[sink] Device {peer_id} is already trusted.")
+                    elif peer_id in peer_status:
+                        peer_info = peer_status[peer_id]
+                        state = peer_info['state']
+                        if state == 'pending':
+                            peer_info['state'] = 'requested'
+                            print(f"[sink] Requesting to sync with {peer_info['name']}.")
+                            try:
+                                headers = {'X-Sink-Device-ID': DEVICE_ID, 'X-Sink-Device-Name': get_hostname()}
+                                requests.post(f"http://{peer_info['ip']}:{PEER_PORT}/auth", headers=headers, json={'action': 'request_trust'}, timeout=5)
+                                print(f"[sink] Request sent. Please approve on {peer_info['name']} as well.")
+                            except requests.exceptions.RequestException as e:
+                                print(f"[sink] Could not connect to {peer_info['name']}: {e}")
+                                peer_info['state'] = 'pending' 
+                        elif state == 'approved': 
+                            print(f"[sink] Approving request from {peer_info['name']}.")
+                            add_trusted_device(peer_id, peer_info['name'], peer_info['ip'])
+                            newly_trusted_peer = peer_status.pop(peer_id)
+                            known_peers[peer_id] = newly_trusted_peer
+                            try:
+                                headers = {'X-Sink-Device-ID': DEVICE_ID, 'X-Sink-Device-Name': get_hostname()}
+                                requests.post(f"http://{peer_info['ip']}:{PEER_PORT}/auth", headers=headers, json={'action': 'confirm_trust'}, timeout=5)
+                            except requests.exceptions.RequestException: pass
+                            threading.Thread(target=sync_folder_to_peer, args=(newly_trusted_peer,), daemon=True).start()
+                        elif state == 'requested':
+                            print("[sink] Already requested. Waiting for them to approve.")
+                    else:
+                        print(f"[sink] Device {peer_id} not found. Waiting for discovery...")
+
+            elif command == 'devices':
+                print("\n--- sink LAN Devices ---")
+                trusted_devices = load_trusted_devices()
+                online_trusted = {p for p in known_peers}
+                
+                if trusted_devices:
+                    print("Trusted:")
+                    for dev_id, dev_info in trusted_devices.items():
+                        status = "online" if dev_id in online_trusted else "offline"
+                        print(f"  - {dev_info['name']} ({dev_id}) [{status}]")
+                
+                with peer_lock:
+                    pending = {k:v for k,v in peer_status.items() if v['state'] == 'pending'}
+                    approved = {k:v for k,v in peer_status.items() if v['state'] == 'approved'}
+                    requested = {k:v for k,v in peer_status.items() if v['state'] == 'requested'}
+
+                    if pending:
+                        print("Discovered (can be trusted):")
+                        for peer_id, peer_info in pending.items():
+                            print(f"  - {peer_info['name']} ({peer_id})")
+                    if approved:
+                        print("Needs your approval:")
+                        for peer_id, peer_info in approved.items():
+                             print(f"  - {peer_info['name']} ({peer_id})")
+                    if requested:
+                        print("Awaiting their approval:")
+                        for peer_id, peer_info in requested.items():
+                             print(f"  - {peer_info['name']} ({peer_id})")
+                if not (trusted_devices or peer_status):
+                    print("No other devices found yet.")
+                print("------------------------")
+            else:
+                print(f"Unknown command. Available: devices, trust <device_id>")
+        except (EOFError, KeyboardInterrupt):
+            break
+        except Exception as e:
+            print(f"[sink] Error in command handler: {e}")
+
 if __name__ == "__main__":
     load_sinkignore()
     print(f"[sink] Syncing folder: {SYNC_FOLDER}")
-
-    snapshot = snapshot_folder()
-    for path, (typ, val) in snapshot.items():
-        if typ == "dir":
-            mkdir_on_peers(path)
-        elif typ == "file":
-            absf = abs_path(path)
-            hash_cache[path] = val
-            sync_to_peers(path, absf, val)
+    print(f"[sink] My device ID: {DEVICE_ID}")
 
     threading.Thread(target=run_http_server, daemon=True).start()
     start_discovery()
     threading.Thread(target=poll_and_sync, daemon=True).start()
     threading.Thread(target=watch_sinkignore, daemon=True).start()
+    threading.Thread(target=handle_user_input, daemon=True).start()
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("[sink] Exiting.")
+        print("\n[sink] Exiting.")

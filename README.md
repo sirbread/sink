@@ -1,9 +1,5 @@
 # sink
 todo: 
-- if very large changes, asks confirm
-- ~~"remember" a device~~, and optinally only try to find it
-- ~~.sinkignore (haha get it because gitignore sinkignore laughing so hard rn)~~
-- ui (make it electron not pyqt you cheap shit)
-- delta sync
-- ~~multiple peers not just 2 (meshing it)~~ fuck this, daisy chaining works
+- ~~d auth confirm back~~
+- ui (make it electron not pyqt you cheap shit)(i'm probably gonna make it pyqt, sorry)
 - system tray shenanigans 
