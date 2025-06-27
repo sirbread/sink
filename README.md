@@ -3,7 +3,7 @@ sync any directory with 2 windows machines over your local network. <br>
 no emailing yourself stuff. no cloud. no flash drives. no bs. <br>
 <br>
 _note_: this is still a _veeery_ big wip, as there are many features that I have planned to added; you can see this on the bottom of this readme.<br>
-<br>
+
 ## features
 - automatically finds other computers running sink on your network
 - you pick which devices to trust. no randoms can connect
@@ -29,7 +29,7 @@ the script will automatically pick up any changes to this file, no need to resta
 ## run ts
 you know the drill
 1. clone thy repo
-2. 2. install requirements.txt
+2. install requirements.txt
 3. cd to the repo, then simple run main.py
 4. all syncing will occur in the same directory as main.py, in a folder called sync across both devices.
   
