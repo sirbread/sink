@@ -4,7 +4,7 @@ no emailing yourself stuff. no cloud. no flash drives. no bs. <br>
 <br>
 _note_: this is still a _veeery_ big wip, as there are many features that I have planned to added; you can see this on the bottom of this readme.<br>
 <br>
-
+i built this to solve a specific problem: syncing files on a locked-down school laptop where python was one of the only things i was allowed to run.
 ## features
 - automatically finds other computers running sink on your network
 - you pick which devices to trust. no randoms can connect
