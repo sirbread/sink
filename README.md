@@ -3,6 +3,8 @@ sync any directory with 2 windows machines over your local network. <br>
 no emailing yourself stuff. no cloud. no flash drives. no bs. <br>
 <br>
 _note_: this is still a _veeery_ big wip, as there are many features that I have planned to added; you can see this on the bottom of this readme.<br>
+<br>
+_note #2_: windows only. that's on me. 
 
 ## features
 - automatically finds other computers running sink on your network
