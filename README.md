@@ -40,6 +40,6 @@ wait is there no boring stuff?
 ## todo (with priority out of 5)
 - UI (4)
 - custom paths (5)
+- encryption (5)
 - system tray shenanigans (3)
 - meshing with more than 2 devices (1)
-- delta sync (maybe?) (2)
