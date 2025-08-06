@@ -9,10 +9,25 @@ import uuid
 import fnmatch
 import json
 from pathlib import Path
+import ssl
 
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
+
+# unissueing rn
+# iykyk
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+    import datetime
+except ImportError:
+    print("cryp imports got cryp")
+    sys.exit(2)
+
 
 SYNC_FOLDER = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd() / "sync"
 SYNC_FOLDER.mkdir(exist_ok=True)
@@ -21,17 +36,74 @@ SERVICE_TYPE = "_sinklan._tcp.local."
 DEVICE_ID = str(uuid.uuid4())[:8]
 SERVICE_NAME = f"sink-{DEVICE_ID}._sinklan._tcp.local."
 
+CONFIG_DIR = Path(__file__).parent / ".sink_config"
+CONFIG_DIR.mkdir(exist_ok=True)
+
 SINKIGNORE_PATH = Path(__file__).parent / ".sinkignore"
 ignore_patterns = []
 ignore_lock = threading.Lock()
 
-DEVICES_FILE = Path(__file__).parent / "devices.json"
+DEVICES_FILE = CONFIG_DIR / "devices.json"
+CERT_FILE = CONFIG_DIR / "cert.pem"
+KEY_FILE = CONFIG_DIR / "key.pem"
+CERT_FINGERPRINT = None
 
 conflicted_paths = set()
 conflicted_paths_lock = threading.Lock()
 known_peers = {}
 peer_status = {}
 peer_lock = threading.Lock()
+
+def generate_self_signed_cert():
+    #is your baby crying? i'll make them have encryption! please encryypt please encryyppt! please encry-y-y-y-ypt!
+    global CERT_FINGERPRINT
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        with open(CERT_FILE, "rb") as f:
+            cert_data = f.read()
+            cert = x509.load_pem_x509_certificate(cert_data)
+            CERT_FINGERPRINT = cert.fingerprint(hashes.SHA256()).hex()
+        print("[sink] SSL certificate already exists.")
+        return
+
+    print("[sink] Generating a new SSL cert...")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"Colorado"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, u"Denver"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"SinkLAN"),
+        x509.NameAttribute(NameOID.COMMON_NAME, f"sink-{DEVICE_ID}"),
+    ])
+
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        key.public_key()
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.datetime.utcnow()
+    ).not_valid_after(
+        datetime.datetime.utcnow() + datetime.timedelta(days=365*10)
+    ).add_extension(
+        x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
+        critical=False,
+    ).sign(key, hashes.SHA256())
+
+    with open(KEY_FILE, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+    with open(CERT_FILE, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    
+    CERT_FINGERPRINT = cert.fingerprint(hashes.SHA256()).hex()
+    print(f"[sink] New SSL certificate generated. Fingerprint: {CERT_FINGERPRINT[:16]}...")
 
 def get_hostname():
     return socket.gethostname()
