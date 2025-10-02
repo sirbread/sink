@@ -2,7 +2,7 @@
 sync any directory with 2 windows machines over your local network. <br>
 no emailing yourself stuff. no cloud. no flash drives. no bs. <br>
 <br>
-_note_: this is still a _veeery_ big wip, as there are many features that I have planned to added; you can see this on the bottom of this readme.<br>
+_note_: this is still a _veeery_ big wip, as there are many features that I have planned to added; you can see this on the bottom of this readme. and no, development isn't dead just yet (soon™)<br>
 <br>
 i built this to solve a specific problem: syncing files on a locked-down school laptop where python was one of the only things i was allowed to run.
 ## features
