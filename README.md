@@ -43,3 +43,4 @@ wait is there no boring stuff?
 - encryption (5)
 - system tray shenanigans (3)
 - meshing with more than 2 devices (1)
+- manual IP add as a fallback "your ip is xxx.xxx.xxx.xxx, enter the other device's IP below and trust..."
